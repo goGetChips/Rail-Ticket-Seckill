@@ -1,0 +1,24 @@
+=========== JDK environment verification ===========
+
+JAVA_HOME (User)  = [D:\jdk-17.0.20.1]
+
+User PATH         = [%JAVA_HOME%\bin;C:\Users\1114126\AppData\Local\Microsoft\WindowsApps;C:\Users\1114126\AppData\Local\Microsoft\WinGet\Packages\OpenJS.NodeJS.LTS_Microsoft.Winget.Source_8wekyb3d8bbwe\node-v24.18.1-win-x64;D:\Program Files\cursor\resources\app\bin;C:\Users\1114126\AppData\Local\Microsoft\WinGet\Packages\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe;;D:\Program Files\Git\cmd]
+
+[PASS] java.exe exists at: D:\jdk-17.0.20.1\bin\java.exe
+[INFO] User PATH references JAVA_HOME (REG_EXPAND_SZ will expand it at process launch)
+[INFO] Seeded $env:JAVA_HOME = D:\jdk-17.0.20.1  (referenced by user PATH)
+
+User PATH (expanded) = [D:\jdk-17.0.20.1\bin;C:\Users\1114126\AppData\Local\Microsoft\WindowsApps;C:\Users\1114126\AppData\Local\Microsoft\WinGet\Packages\OpenJS.NodeJS.LTS_Microsoft.Winget.Source_8wekyb3d8bbwe\node-v24.18.1-win-x64;D:\Program Files\cursor\resources\app\bin;C:\Users\1114126\AppData\Local\Microsoft\WinGet\Packages\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe;;D:\Program Files\Git\cmd]
+
+--- Which java.exe wins on the effective PATH ---
+[PASS] resolved to: D:\jdk-17.0.20.1\bin\java.exe
+
+--- java -version ---
+  java version "17.0.20.1" 2026-08-18 LTS
+  Java(TM) SE Runtime Environment (build 17.0.20.1+1-LTS-4)
+  Java HotSpot(TM) 64-Bit Server VM (build 17.0.20.1+1-LTS-4, mixed mode, sharing)
+
+--- javac -version ---
+  javac 17.0.20.1
+
+===================================================

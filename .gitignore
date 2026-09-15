@@ -1,0 +1,50 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+### 本项目新增 ###
+
+# 本机环境变量的回滚备份。
+# 只对本机有意义（含 C:\Users\<用户名> 这样的绝对路径），
+# 提交到公开仓库既无用、又会暴露 Windows 用户名。
+# 文件仍保留在本地，需要回滚时照样能用。
+scripts/env/backup-*.txt
+
+# 本地私有配置：真实密码写在这里，不进版本库。
+# 约定：
+#   可提交   application.yml         用 ${DB_PASSWORD:rail123456} 占位，
+#                                   别人拉下来不配环境变量也能直接跑
+#   不提交   application-local.yml   本机的真实密码 / 私有地址
+**/application-local.yml
+**/application-local.yaml
+**/application-local.properties

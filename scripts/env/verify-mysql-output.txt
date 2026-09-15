@@ -1,0 +1,62 @@
+===
+---------- 第一部分：结构检查 ----------
+检查1 四个数据库
+PASS
+检查2 九张表
+PASS
+检查3 库存表 CHECK 约束
+PASS
+检查4 表名全小写
+PASS
+检查5 字符集统一 utf8mb4
+PASS
+库	表	索引
+rail_inventory	t_seat_inventory	uk_train_date_seat
+rail_inventory	t_stock_flow	uk_biz_id_type
+rail_order	t_order	uk_order_no
+rail_order	t_order_item	uk_user_train_date_seat
+
+
+===
+---------- 第二部分：行为验证 ----------
+说明
+下面每处 ERROR 都是预期内的，是约束生效的证据
+
+
+===
+--- 测试A 期望出现 ERROR: Duplicate entry ---
+ERROR 1062 (23000) at line 87: Duplicate entry '999999999-999999999-2026-10-01-3' for key 't_order_item.uk_user_train_date_seat'
+测试A 结果
+被数据库拒绝（只留下 1 条）
+
+
+===
+--- 测试B 期望出现 ERROR: Check constraint ---
+ERROR 3819 (HY000) at line 98: Check constraint 'ck_sold_non_negative' is violated.
+测试B 结果
+被数据库拒绝（仍是 0）
+
+
+===
+--- 测试C 期望出现 ERROR: Check constraint ---
+ERROR 3819 (HY000) at line 109: Check constraint 'ck_sold_not_exceed_total' is violated.
+测试C 结果
+被数据库拒绝（仍是 0）
+
+
+===
+--- 测试D 条件 UPDATE（阶段5 的扣减手法）---
+D1 有余票时扣减-受影响行数(期望1)
+1
+D2 已售罄时扣减-受影响行数(期望0)
+0
+
+
+===
+--- 清理测试数据 ---
+残留-库存	残留-订单明细
+0	0
+
+
+===
+=========== 验证结束 ===========
