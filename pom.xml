@@ -1,54 +1,149 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-	<modelVersion>4.0.0</modelVersion>
-	<parent>
-		<groupId>org.springframework.boot</groupId>
-		<artifactId>spring-boot-starter-parent</artifactId>
-		<version>3.5.9</version>
-		<relativePath/> <!-- lookup parent from repository -->
-	</parent>
-	<groupId>com.example</groupId>
-	<artifactId>Rail-Ticket-Seckill</artifactId>
-	<version>0.0.1-SNAPSHOT</version>
-	<name>Rail-Ticket-Seckill</name>
-	<description>Rail-Ticket-Seckill</description>
-	<url/>
-	<licenses>
-		<license/>
-	</licenses>
-	<developers>
-		<developer/>
-	</developers>
-	<scm>
-		<connection/>
-		<developerConnection/>
-		<tag/>
-		<url/>
-	</scm>
-	<properties>
-		<java.version>17</java.version>
-	</properties>
-	<dependencies>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter</artifactId>
-		</dependency>
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
 
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-test</artifactId>
-			<scope>test</scope>
-		</dependency>
-	</dependencies>
+    <!--
+      ==========================================================================
+      根 POM —— 它同时扮演两个角色，这两个角色是独立的，不要混为一谈
+      ==========================================================================
 
-	<build>
-		<plugins>
-			<plugin>
-				<groupId>org.springframework.boot</groupId>
-				<artifactId>spring-boot-maven-plugin</artifactId>
-			</plugin>
-		</plugins>
-	</build>
+        A. 【父 POM】 通过 <parent> 被各子模块继承
+           作用：把依赖版本、编码、编译参数这些"全项目一致"的东西定义一次。
+           子模块写 <parent> 就能拿到。
+
+        B. 【聚合 POM】 通过 <modules> 把子模块收拢成一个构建单元
+           作用：在根目录执行一次 mvn 命令，就能按依赖顺序构建所有子模块。
+
+      为什么放在同一个文件里：Maven 允许一个 POM 同时是父和聚合器，这是绝大多数
+      多模块项目的做法。但必须知道——**去掉 <modules> 它仍是父 POM，去掉 <parent>
+      它仍是聚合器**，两者不是一回事。
+
+      packaging 必须是 pom：它自己不打 jar，只承载配置和模块列表。
+      <dependencies> 里**什么业务依赖都不放**——一旦放了，所有子模块都会被强制引入，
+      这是多模块项目里最常见的污染来源。共享的东西只放 <dependencyManagement>。
+    -->
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.9</version>
+        <relativePath/> <!-- 为空表示去仓库找，不去上层目录找 -->
+    </parent>
+
+    <groupId>com.railseckill</groupId>
+    <artifactId>rail-seckill</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>rail-seckill</name>
+    <description>铁路购票 / 秒杀教学项目（父 POM）</description>
+
+    <!--
+      ==========================================================================
+      模块列表
+      ==========================================================================
+      这里只登记**已经真的有代码**的模块。
+
+      为什么不是一次性把 5 个服务都建出来：
+        一个没有代码的模块不是模块，是占位符。它不证明任何事，却会带来真实的成本——
+        空的 Spring Boot 启动类、空的 application.yml、构建时多编译几个用不上的 jar。
+        而"以后再加一个模块"的成本是**在下面加 3 行**。
+
+      阶段 3~7 会依次加入 rail-user-service、rail-order-service；
+      rail-inventory-service 和 rail-gateway 按 ADR-003 的演进路径推迟到阶段 8。
+      详见 docs/decisions/ADR-003-service-granularity.md
+    -->
+    <modules>
+        <module>rail-train-service</module>
+    </modules>
+
+    <properties>
+        <java.version>17</java.version>
+
+        <!--
+          【为什么必须显式声明这两个编码属性】
+          本机是中文 Windows，JVM 的 file.encoding 默认是 **GBK** 而不是 UTF-8
+          （`mvnw -v` 的 "platform encoding: GBK" 就是证据）。Java 17 尚未默认 UTF-8，
+          那是 JDK 18 的 JEP 400 才做的。
+
+          实测结论（见 scripts/env/README.md §6.2）：
+            · 编译 Java 源码        —— spring-boot-starter-parent 已经设了 UTF-8，本来就没问题
+            · Spring Boot 读 yml    —— Spring Boot 自己按 UTF-8 读，也没问题
+          但**显式写出来仍然必要**：它把"依赖上游默认值正确"变成"我们自己保证正确"。
+          上游换个版本、换个插件，第一项就可能悄悄失效，而症状是"运行时中文乱码"，
+          排查起来会绕很远。
+        -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!-- MyBatis-Plus 版本集中在这里定义。
+             🟢 已联网核实：这是 Maven Central 上的最新版（maven-metadata lastUpdated=20260708）。 -->
+        <mybatis-plus.version>3.5.17</mybatis-plus.version>
+    </properties>
+
+    <!--
+      ==========================================================================
+      dependencyManagement ≠ dependencies
+      ==========================================================================
+        <dependencyManagement>  只声明"如果用到 X，就用这个版本"，**不引入任何 jar**
+        <dependencies>          才是真的引入
+
+      子模块引用 mybatis-plus-spring-boot3-starter 时**不用写 <version>**，版本从这里继承。
+      好处：升级框架版本时只改上面 properties 里的一行。
+
+      注意：Spring Cloud / Spring Cloud Alibaba 的 BOM **现在不在这里**。
+      阶段 8 才引入 Nacos/OpenFeign/Gateway，那时再 import，理由同"不要为了看起来
+      高级而提前加依赖"——现在加了，它们会出现在依赖树里但不做任何事。
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+                <version>${mybatis-plus.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-jsqlparser</artifactId>
+                <version>${mybatis-plus.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <!--
+          pluginManagement 同样只声明配置、不激活插件。
+          子模块要真正用某个插件，仍需在自己的 <build><plugins> 里声明一次（可以不写配置）。
+          这样"哪个模块是可运行的服务"在它的 pom 里一眼可见。
+        -->
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <configuration>
+                        <!--
+                          【为什么运行时也要显式指定 UTF-8】
+                          上面那两个属性只管**编译期**。JVM 运行时的 file.encoding 是另一回事，
+                          它决定 new String(bytes) / FileReader 这类**不显式传字符集**的 API
+                          按什么编码解释字节。本机默认是 GBK。
+
+                          踩坑预告：阶段 7 要用 Java 读 Redis 的 Lua 脚本文件，阶段 6 要读
+                          JMeter 的测试数据。只要有一处忘了写 StandardCharsets.UTF_8，
+                          中文就会变成乱码——**而且是"看起来能跑、结果不对"那种**。
+                          这里统一把默认值掰成正的，剩下的靠代码规范兜底。
+
+                          注意：它只对 `mvn spring-boot:run` 和 repackage 出来的 jar 生效。
+                          在 IntelliJ 里直接点 Run 走的是 IDEA 自己的启动器，**要在
+                          Run Configuration 的 VM options 里手动加 -Dfile.encoding=UTF-8**。
+                          （见 README 的"如何运行"）
+                        -->
+                        <jvmArguments>-Dfile.encoding=UTF-8</jvmArguments>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
 
 </project>

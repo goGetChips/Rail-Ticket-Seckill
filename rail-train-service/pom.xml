@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.railseckill</groupId>
+        <artifactId>rail-seckill</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <!--
+          这里**不写 <relativePath/>**，和根 POM 里那个 <parent> 正好相反。
+          区别在于：
+            根 POM 的父是 spring-boot-starter-parent，在仓库里，所以要 <relativePath/> 阻止它去上级目录找
+            这里的父是根 POM，就在上一级目录，让 Maven 按默认的 ../pom.xml 去找即可
+          写错了症状都差不多：构建时报"找不到父 POM"。
+        -->
+    </parent>
+
+    <artifactId>rail-train-service</artifactId>
+    <name>rail-train-service</name>
+    <description>车次服务：车次、车站、经停站、票价（阶段 3 起）</description>
+
+    <!--
+      ==========================================================================
+      依赖：用到哪个加哪个
+      ==========================================================================
+      阶段 3 只加三样：Web、MyBatis-Plus、MySQL 驱动。
+
+      刻意**没有**加的（以及它们计划在哪个阶段加）：
+        · nacos-discovery        —— 阶段 8，现在没有别的服务可发现
+        · spring-cloud-starter-openfeign —— 阶段 8，现在没有别的服务可调用
+        · spring-boot-starter-data-redis —— 阶段 7，现在还没有热点数据要缓存
+        · spring-boot-starter-validation  —— 阶段 4 写查询参数校验时再加
+        · spring-boot-starter-actuator    —— 阶段 8 做健康检查时再加
+        · lombok                 —— 见下方说明
+
+      【关于 Lombok：本次不加】
+      写实体类要多写 5 组 getter/setter，确实是样板代码。
+      不加的理由是：它是个**编译期注解处理器**，需要在 IDE 里额外装插件、并开启
+      annotation processing，否则 IDEA 会满屏报红（编译却又是通过的）。
+      阶段 3 的目标是"用最短路径证明工程能跑起来"，引入一个可能干扰判断的新变量不划算。
+      等样板代码真的多到影响阅读时再统一引入，那时只需在根 POM 加一个依赖。
+
+      【版本号去哪了】
+      mybatis-plus 的版本在根 POM 的 <dependencyManagement> 里定义，这里不写。
+      mysql-connector-j 的版本由 spring-boot-starter-parent 管理（3.5.9 对应 9.5.0），
+      **我们也不写**——Boot 保证它和自己测试过的驱动版本一致。
+      自己写死版本号的代价是：升级 Boot 时驱动不会跟着升，可能出现兼容性问题。
+    -->
+    <dependencies>
+        <!--
+          提供内嵌 Tomcat + Spring MVC + Jackson。
+          【为什么是 starter-web 而不是 starter】
+          根 POM 原来用的是 spring-boot-starter，它只给 Spring 核心容器，
+          **不带 Web 服务器**——启动后进程会立刻退出，因为没有非守护线程撑着。
+          这是初学阶段"程序跑完就退出了"的最常见原因。
+          代价是启动时间从 ~1s 涨到 ~2s，内存多占几十 MB，值得。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!--
+          MyBatis-Plus 的 Spring Boot 3 专用 starter。
+          ⚠️ 注意 artifactId 里的 **spring-boot3**：Spring Boot 3 用的是
+          jakarta.* 而不是 javax.*，MP 为此单独发了 starter。
+          用错成 mybatis-plus-boot-starter 的症状是启动时报
+          "NoClassDefFoundError: javax/servlet/..."，很难一眼看出是依赖选错了。
+        -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+        </dependency>
+
+        <!--
+          【这个依赖看起来像多余的，其实不加会炸】
+          从 MyBatis-Plus 3.5.9 起，JSqlParser（一个 SQL 解析库）被拆成了独立依赖。
+          MP 里所有需要**解析 SQL 才能改写它**的功能都依赖它，最典型的是分页插件
+          PaginationInnerInterceptor。
+
+          如果不加：编译期完全正常，启动也正常，**直到第一次调用分页查询**才抛
+          NoClassDefFoundError: net/sf/jsqlparser/statement/select/Select。
+          这种"编译通过、运行时才炸"的依赖缺失，是最容易浪费时间的坑之一。
+
+          阶段 4 做车次分页查询就会用到，所以现在就加。版本与 starter 同源，由根 POM 统一管理。
+        -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+        </dependency>
+
+        <!--
+          MySQL 驱动。
+          scope 是默认的 compile，不是 runtime——**这不影响功能**，
+          但 Maven 官方建议驱动用 runtime scope（编译期不需要它的类）。
+          本项目不用 runtime，因为保持默认更简单，且 IDE 里能直接点进驱动类看源码。
+          【面试提醒】如果被问到，正确回答是"用 runtime 更规范，我用默认 scope 是取舍"，
+          而不是硬说默认 scope 更好。
+        -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              声明它（配置在根 POM 的 pluginManagement 里）有两个作用：
+                1. 让 mvn package 产出**可执行的 fat jar**（java -jar 能直接跑）
+                2. 让 mvn spring-boot:run 生效，并带上 -Dfile.encoding=UTF-8
+            -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

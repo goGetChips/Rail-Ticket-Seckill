@@ -9,6 +9,7 @@
 | # | 发生阶段 | 问题 | 严重度 | 状态 |
 | --- | --- | --- | --- | --- |
 | 1 | 阶段 1→3 之间 | 公司 DLP 把 `.gitignore` 加密写盘，git 只能存到密文 | 🔴 高（可致真实密码泄露） | ✅ 已修复 + 已加守卫 |
+| 2 | 阶段 3 | MySQL 时区表为空，JDBC 连接直接失败，报的却是"拿不到连接" | 🟡 中（无法启动，但排查路径清晰） | ✅ 已修复 |
 
 ---
 
@@ -210,6 +211,228 @@ printf '#!/bin/sh\nbash scripts/env/check-dlp-encryption.sh || exit 1\n' > .git/
 2. **这类问题的危害不在功能，而在「静默」。**
    `.gitignore` 失效会让 `application-local.yml`（真实密码）被正常提交，而且它在仓库里是二进制乱码，review 时没人会点开。**所以修复之后必须补一个守卫，把它从"静默"变成"响亮"。**
 
-> **这条经验在这个项目里已经出现过两次。**
-> 另一次见 [scripts/env/README.md §五 坑 1](../../scripts/env/README.md)：当时 `.NET` 的 `GetEnvironmentVariable` 不展开 `REG_EXPAND_SZ`，让验证脚本把一个**正确**的环境变量配置误判成错误。
-> 两次的共同点是——**报错时先怀疑测量工具，再怀疑被测对象**。
+> **这条经验在这个项目里已经出现过三次，值得单独记住。**
+>
+> | # | 场合 | 测量工具错在哪 | 差点得出的错误结论 |
+> | --- | --- | --- | --- |
+> | 1 | 本案例修复后自查 | `git check-ignore` **默认查索引**，而目标文件已经暂存 | "忽略规则还是没生效"——其实已经生效了，要用 `--no-index` |
+> | 2 | [scripts/env/README.md §五 坑 1](../../scripts/env/README.md) | `.NET` 的 `GetEnvironmentVariable` **不展开** `REG_EXPAND_SZ` | "环境变量配错了"——其实配对了，是验证脚本拼出了不存在的路径 |
+> | 3 | 阶段 3 检查行尾 | 引用写法不对，`grep -c $'\r$'` 退化成"匹配任意含 r 的行" | "仓库里的 `.sh` 是 CRLF"——用 `tr -cd '\r' \| wc -c` 一数，**CR 字节数 = 0**，是纯 LF |
+>
+> 三次的共同点是——**报错时先怀疑测量工具，再怀疑被测对象**。
+>
+> 第 3 次特别有代表性：它**没有报错**，只是给了一个错误答案。
+> 命令跑通了、有输出、看起来像个结果——**这比报错更危险**。
+> 所以现在的习惯是：**任何"结论性"的测量，都要用一个原理不同的方法交叉验证一次。**
+> （第 3 次就是靠 `tr` + `wc` 才发现的：数字对不上。）
+
+---
+
+## 案例 2：MySQL 时区表为空，导致 Spring Boot 连不上数据库
+
+- **发现时间**：2026-09-17，阶段 3 首次启动 `rail-train-service` 时
+- **环境**：Windows 10 Pro 19045 + MySQL 8.4.8（Windows 版）+ mysql-connector-j 9.5.0
+
+### 1. 问题现象
+
+服务启动**完全正常**，Tomcat 在 8082 端口起来了，日志里没有任何异常。
+
+但第一次调接口就 500：
+
+```console
+$ curl -i http://127.0.0.1:8082/api/train/stations/VNP
+HTTP/1.1 500
+{"timestamp":"2026-09-17T04:13:34.241+00:00","status":500,"error":"Internal Server Error","path":"/api/train/stations/VNP"}
+```
+
+> 注意：**启动时连不上数据库不会报错**。因为 HikariCP 是**懒加载**的——
+> 它到第一次真正取连接时才去建池。所以"服务能起来"完全不等于"数据库配对了"。
+> 这一点很值得记：如果依赖"启动成功"作为验证，会得到一个**假的通过**。
+
+### 2. 日志
+
+```
+ERROR o.a.c.c.C.[.[.[/].[dispatcherServlet] : Servlet.service() for servlet
+  [dispatcherServlet] threw exception [Request processing failed:
+  org.apache.ibatis.exceptions.PersistenceException:
+### Error querying database.
+  Cause: org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection
+### Cause: org.springframework.jdbc.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection]
+  with root cause
+
+java.sql.SQLException: Unknown or incorrect time zone: 'Asia/Shanghai'
+	at com.mysql.cj.jdbc.exceptions.SQLError.createSQLException(SQLError.java:121)
+	at com.mysql.cj.jdbc.ConnectionImpl.createNewIO(ConnectionImpl.java:840)
+	at com.zaxxer.hikari.pool.HikariPool.createPoolEntry(HikariPool.java:488)
+	at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:111)
+	...
+```
+
+### 3. 初步判断（**这个判断是错的**）
+
+看到 `CannotGetJdbcConnectionException: Failed to obtain JDBC Connection`，第一反应是：
+
+- MySQL 服务没启动？→ 但是 `mysql` 命令行连得上，排除
+- 密码错了？→ 但密码错会报 `Access denied`，不是这个
+- 账号没有权限？→ 但 `rail` 账号是 `sql/00_init.sql` 建的，权限齐全
+- 连接串写错了？→ 但库名 `rail_train` 确实存在
+
+三个假设全部否掉，因为**它们都无法解释一个事实**：报错信息里没有出现任何关于"密码""权限""主机"的字眼。
+
+**转折点**是注意到那行 `with root cause` —— 它后面才是真正的异常。
+
+### 4. 排查过程
+
+**第一步：读完整的异常链，而不是第一条异常。**
+
+`Failed to obtain JDBC Connection` 只是 MyBatis/Spring 对底层异常的**包装**，
+它在说"我拿不到连接"，但**没说是为什么**。真正的异常在最后一行：
+
+```
+java.sql.SQLException: Unknown or incorrect time zone: 'Asia/Shanghai'
+```
+
+**第二步：直接在 MySQL 里复现这个异常。** 不猜，去问数据库。
+
+```console
+$ mysql -h 127.0.0.1 -u root -e "SET time_zone='Asia/Shanghai'; SELECT NOW();"
+ERROR 1298 (HY000) at line 1: Unknown or incorrect time zone: 'Asia/Shanghai'
+```
+
+复现成功，而且报的是**一模一样的错误码和文案**。
+
+**第三步：确认根本原因——时区表是空的。**
+
+```console
+$ mysql -h 127.0.0.1 -u root -e "SELECT COUNT(*) FROM mysql.time_zone_name;"
++----------+
+| COUNT(*) |
++----------+
+|        0 |
++----------+
+```
+
+`mysql.time_zone_name` **一行数据都没有**。MySQL 支持两种写时区的方式：
+
+| 写法 | 是否需要元数据表 | 本机结果 |
+| --- | --- | --- |
+| 命名时区 `'Asia/Shanghai'` | ✅ 需要查 `mysql.time_zone_name` | ❌ ERROR 1298 |
+| 数字偏移 `'+08:00'` | ❌ 直接解析 | ✅ 成功 |
+
+```console
+$ mysql -h 127.0.0.1 -u root -e "SET time_zone='+08:00'; SELECT NOW();"
++---------------------+
+| now_at_plus8        |
++---------------------+
+| 2026-09-17 12:13:47 |
++---------------------+
+```
+
+**第四步：确认驱动确实在发这条 SET 语句。**
+
+我们配了 `forceConnectionTimeZoneToSession=true`，它的作用就是"连接建立后立刻执行
+`SET time_zone = <connectionTimeZone>`"。所以驱动拿着 `Asia/Shanghai` 去 SET，
+被服务端拒绝，连接建立失败 → HikariCP 拿不到连接 → MyBatis 包装成
+`CannotGetJdbcConnectionException`。
+
+**整条因果链是通的，没有任何一步是猜的。**
+
+### 5. 真正原因
+
+**Windows 版 MySQL 不自带时区数据。**
+
+MySQL 安装包里有一批 `mysql.time_zone*` 表，需要靠 `mysql_tzinfo_to_sql` 工具
+读操作系统的时区数据库来填充。**这个工具只在 Unix/Linux 上提供**，
+Windows 版没有，所以装了就是空的。
+
+这不是本机配置错误，也不是 MySQL 的 bug —— 它是 Windows 版的一个已知特性
+（MySQL 官方文档里明确说明 Windows 下需要手工导入时区数据）。
+
+### 6. 解决方案
+
+把 `connectionTimeZone` 从命名时区改成**数字偏移**：
+
+```diff
+- connectionTimeZone=Asia/Shanghai
++ connectionTimeZone=%2B08:00
+```
+
+`%2B` 是 URL 编码的 `+`（避免 `+` 在 URL 查询串里被解释成空格）。
+
+### 7. 为什么有效
+
+- **数字偏移不查表**：`+08:00` 由 MySQL 直接解析成一个固定偏移量，
+  不需要 `mysql.time_zone_name` 里有对应记录。所以时区表空不空都不影响它。
+- **为什么用数字偏移对本国应用是安全的**：中国自 **1991 年**起废止夏令时，
+  东八区全年恒定，不存在"某天偏移量变一小时"的情况。
+- **⚠️ 这个前提必须写清楚**：如果项目要服务多时区，或部署在有夏令时的国家，
+  数字偏移会算错时间，此时必须填充时区表。**图省事用数字偏移而不写明前提，就是埋雷。**
+
+> **替代方案（本次没采用）**：往 `mysql.time_zone*` 表里导入时区数据。
+> 没采用的理由：Windows 上没有 `mysql_tzinfo_to_sql`，
+> 需要先弄到一份现成的 SQL dump 再导入，多一个不可控的步骤；
+> 而本项目只服务一个时区，数字偏移完全够用，且**行为更可预测**（不依赖任何外部数据）。
+
+### 8. 优化前 / 优化后
+
+| 项目 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 连接串的时区参数 | `connectionTimeZone=Asia/Shanghai` | `connectionTimeZone=+08:00` |
+| 连接能否建立 | 🔴 否，HikariCP 抛 `CannotGetJdbcConnectionException` | 🟢 是 |
+| `GET /api/train/stations/VNP` | 500 | 200，返回真实数据 |
+| 对 `mysql.time_zone_name` 的依赖 | 有（必须非空） | 无 |
+| 报错时的可读性 | 表面原因（拿不到连接）与真实原因（时区解析失败）相隔 5 层调用栈 | — |
+
+**验证证据（实测输出）**：
+
+```console
+$ curl -sS http://127.0.0.1:8082/api/train/stations/VNP
+{"id":1,"stationCode":"VNP","stationName":"北京南","cityName":"北京","createTime":"2026-09-17T12:12:57"}
+
+$ curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8082/api/train/stations/NOPE
+HTTP 404
+```
+
+日志里能同时看到连接成功和真实执行的 SQL：
+
+```
+INFO  com.zaxxer.hikari.HikariDataSource : HikariPool-1 - Start completed.
+DEBUG c.r.t.m.StationMapper.selectWithCursor : ==>  Preparing: SELECT id,station_code,station_name,city_name,create_time FROM t_station WHERE (station_code = ?)
+DEBUG c.r.t.m.StationMapper.selectWithCursor : ==> Parameters: VNP(String)
+DEBUG c.r.t.m.StationMapper.selectWithCursor : <==      Total: 1
+DEBUG c.r.t.mapper.StationMapper.selectList   : <==      Total: 14
+```
+
+### 9. 面试如何回答
+
+> 阶段 3 第一次调接口返回 500，日志说 `Failed to obtain JDBC Connection`。
+> 我先按"连不上库"的思路排查，否掉了三个假设——MySQL 没启动（命令行连得上）、
+> 密码错（那会报 Access denied）、权限不足（账号是建表脚本建的）。
+> 三个都解释不通之后，我注意到异常链最后一行的 `with root cause`，
+> 真正的异常是 `Unknown or incorrect time zone: 'Asia/Shanghai'`。
+> 然后我直接去数据库里执行 `SET time_zone='Asia/Shanghai'`，**一模一样地复现了它**，
+> 再查 `mysql.time_zone_name` 发现是 **0 行**——
+> Windows 版 MySQL 不带时区数据，填充它需要的 `mysql_tzinfo_to_sql` 只在 Unix 提供。
+> 改成数字偏移 `+08:00` 就好了，因为数字偏移不查表。
+> 中国从 1991 年起没有夏令时，东八区恒定，所以用固定偏移是安全的——
+> 但如果项目要跨时区部署，就必须先把时区表填上。
+
+**最值得说的三点：**
+
+1. **报错信息指向的位置，往往不是原因所在。**
+   `CannotGetJdbcConnectionException` 说的是"拿不到连接"，
+   真实原因是"连接建立时执行的一条 SET 语句被服务端拒绝了"。
+   **读异常一定要读到最底层的 root cause**，中间层的包装异常只说明"谁在什么时候失败了"，
+   不说明"为什么失败"。
+
+2. **要能区分"服务启动成功"和"依赖配置正确"。**
+   HikariCP 懒加载，所以数据库配置全错服务照样起得来——**启动成功是一个假信号**。
+   这个项目从阶段 3 起，每个阶段的完成判据都必须是"**真的调一次、看到真实数据**"，
+   而不是"没报错"。这也是本项目坚持不把"代码生成成功"当"功能完成"的原因。
+
+3. **"能跑"和"可移植"是两件事。**
+   如果只在本机跑，`SET time_zone='+08:00'` 在客户端里敲一下也能让当时的会话工作；
+   但把它写进连接串，才能保证**每一次连接**都一致。
+   更关键的是，我把"中国无夏令时"这个前提**显式写进了配置注释**——
+   将来有人把这个项目部署到有时区的地区，看到注释就知道这里会出问题。
+   **一个正确的配置如果没说清它的前提，它就只是一个碰巧能跑的配置。**
