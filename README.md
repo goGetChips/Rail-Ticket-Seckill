@@ -1,251 +1,188 @@
 # Rail-Ticket-Seckill
 
-> 一个用于**深入理解分布式高并发**的铁路购票/秒杀教学项目。
-> 目标不是功能齐全，而是能对每一个设计决策回答"**为什么这么做**"和"**为什么不用 X**"。
+> 一个用于**深入理解分布式高并发**的铁路购票 / 秒杀教学项目。
+> 目标不是功能齐全，而是能对每一个设计决策回答「**为什么这么做**」和「**为什么不用 X**」。
+
+**一句话说清它要解决什么**：把「判断库存够不够」和「扣减库存」压成**一步原子操作**——用 MySQL 的行锁 + 条件 UPDATE，用 Redis 的 Lua 脚本，用消息队列的异步落库，三种形态讲同一个道理。
+
+**第一次读这个项目，从这里开始** → [项目阅读指南](docs/01-project-guide.md)
 
 ---
 
-## 当前状态（2026-09-17）
+## 当前开发状态
 
-**阶段 0～3 已完成。仓库现在有可以真正跑起来、并真的读到了数据库的服务。**
+**阶段 0~3 已完成。仓库里有能真正跑起来、并真的读到了数据库的服务。**
 
-| 内容 | 状态 |
+当前可运行的只有 `rail-train-service` 一个模块，对外提供 **2 个车站查询接口**。购票、库存、秒杀、微服务拆分、MQ 全部尚未开始。
+
+| 阶段 | 状态 |
 | --- | --- |
-| 阶段 0 架构设计 | ✅ → [docs/architecture/phase0-design.md](docs/architecture/phase0-design.md) |
-| 阶段 1 环境搭建 | ✅ JDK 17 / Maven 3.9.16 / MySQL 8.4.8 / Redis 8.10.1 / Nacos 3.2.3 全部就绪 |
-| 阶段 2 数据库设计 | ✅ → [docs/database/schema-design.md](docs/database/schema-design.md)，建表脚本在 [sql/](sql/) |
-| 阶段 3 项目初始化 | ✅ 多模块骨架 + `rail-train-service` 可启动、可查库（详见下方"如何运行"） |
-| 压测脚本、MQ | ❌ / ⏸️ 尚未编写（阶段 6 起 / 选型推迟到阶段 9） |
+| 0 需求与架构设计 / 1 环境搭建 / 2 数据库设计 / 3 项目初始化 | ✅ 已完成 |
+| **4 核心业务（单体）** | ⏭️ **下一步** |
+| 5~11（购票、压测、Redis、微服务拆分、MQ、复盘） | ⬜ 未开始 |
 
-### 已完成的关键验证（实测，非推断）
-
-| 验证 | 证据 |
-| --- | --- |
-| **服务能起来并读到真实数据**（阶段 3） | `curl http://127.0.0.1:8082/api/train/stations/VNP` → `200` + `{"stationCode":"VNP","stationName":"北京南",...}`；查不到的车站返回 `404`；列表接口返回 14 行，日志里能看到真实执行的 SQL |
-| **JVM 的 `file.encoding` 真的是 UTF-8**（阶段 3） | `jcmd <pid> VM.system_properties` → `file.encoding=UTF-8`（不加参数时本机默认是 GBK） |
-| Redis 第三方移植版的 **Lua 原子性** | [scripts/env/verify-redis.sh](scripts/env/verify-redis.sh) —— 100 张票 vs 1000 并发请求 → 余票恰好 0、恰好 100 人成功；同一用户 1000 并发 → 恰好扣 1 张 |
-| MySQL **唯一索引 / CHECK 约束真的拦得住** | [sql/99_verify.sql](sql/99_verify.sql) —— 故意制造重复购票、负库存、超卖，数据库**全部拒绝** |
-| 条件 UPDATE 的 **CAS 行为** | 同上 —— 有余票时受影响 1 行、已售罄时受影响 0 行 |
-
-### ⚠️ 本机环境的一个已知陷阱（已踩到，已修复）
-
-公司 DLP（亚信安全）会**透明加密「没有扩展名」的文件**：编辑器里看是明文，但 `git.exe` 读到的是磁盘原始密文，会把一坨二进制当成文件内容提交，**全程不报任何错**。
-
-`.gitignore` 恰好是整个工程里唯一一个「必须没有扩展名」的文件——第一次提交时，忽略规则**一条都没生效**，`git add -A` 暂存了 **54** 个文件。
-
-**后果不是「多提交了几个文件」**：`.gitignore` 里的 `**/application-local.yml` 一旦失效，**本机真实数据库密码会被正常提交**，而且它在上游仓库里是二进制乱码，review 时没人会点开看。
-
-- 完整排查过程（含控制变量实验）：[docs/troubleshooting/README.md 案例 1](docs/troubleshooting/README.md)
-- 提交前守卫：`bash scripts/env/check-dlp-encryption.sh`
-- ⚠️ **无扩展名的文件禁止用编辑器保存**（保存动作本身就会触发加密），必须用 bash 重定向生成
-
-> ⚠️ `docs/_drafts-unverified/` 目录下存放的是**一次性 AI 生成的未验证草稿**。
-> 生成时设计规格为空，其中包含**三套互不兼容的服务拆分方案**和**互相矛盾的 MQ 选型结论**，**不得作为设计依据**。
-> 保留它们仅为了在有需要时回收其中有价值的教学内容。
+**完整状态（含已完成功能、部分完成、已知技术债、待拍板事项）见 → [开发状态](docs/status/development-status.md)**
 
 ---
 
-## 如何运行（阶段 3 现状）
+## 启动方式
 
 ### 1. 启动中间件
-
-MySQL 必须先起来，否则服务能启动但**第一次调接口会 500**（HikariCP 懒加载，见 [案例 2](docs/troubleshooting/README.md)）。
 
 ```cmd
 D:\dev_tools\start_all.bat
 ```
 
-它会拉起 MySQL、Nacos、Redis 三个窗口。阶段 3 只需要 **MySQL**，另外两个现在用不到，可以先关掉。
+MySQL 必须先起来，否则服务能启动但**第一次调接口会 500**（HikariCP 懒加载）。当前只有 MySQL 是必需的。
 
 ### 2. 首次准备数据库（只需一次）
 
 ```bash
 MYSQL="D:/dev_tools/mysql-8.4.8-winx64/bin/mysql.exe"
-"$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/00_init.sql
-"$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/01_rail_user.sql
-"$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/02_rail_train.sql
-"$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/03_rail_inventory.sql
-"$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/04_rail_order.sql
-"$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/10_seed_train.sql
+for f in 00_init 01_rail_user 02_rail_train 03_rail_inventory 04_rail_order 10_seed_train; do
+  "$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/$f.sql
+done
 ```
 
-> ⚠️ **`--default-character-set=utf8mb4` 不能省。** 本机 mysql 客户端默认按 GBK 解释字节，
-> 而 `.sql` 文件是 UTF-8 的。不加这个参数，中文会以**乱码形式存进数据库，且不报任何错**——
-> 属于"看起来成功、结果不对"那类问题，排查成本很高。
+> ⚠️ `--default-character-set=utf8mb4` 不能省。本机 mysql 客户端默认按 GBK 解释字节，而 `.sql` 文件是 UTF-8 的——不加这个参数，中文会**以乱码形式存进数据库且不报任何错**。
 
 ### 3. 启动服务
 
 ```bash
-# 在项目根目录
 ./mvnw -pl rail-train-service spring-boot:run
 ```
 
-> ⚠️ **`-pl rail-train-service` 不能省。** 根 POM 是 `packaging=pom` 的聚合模块，
-> 直接 `./mvnw spring-boot:run` 会在根模块上执行，报"找不到主类"。
-> 将来模块间有了依赖，还要再加 `-am`（连带构建被依赖的模块）。
+> ⚠️ `-pl rail-train-service` 不能省。根 POM 是 `packaging=pom` 的聚合模块，直接在根模块执行 `spring-boot:run` 会报「找不到主类」。
 
-**在 IntelliJ 里运行**：直接 Run `RailTrainApplication` 即可，但要在
-Run Configuration 的 **VM options** 里手动加上：
+IntelliJ 里直接 Run `RailTrainApplication` 即可，但要在 Run Configuration 的 **VM options** 里手动加 `-Dfile.encoding=UTF-8`——根 POM 里配的 `jvmArguments` 只对 `mvn spring-boot:run` 生效。
 
-```
--Dfile.encoding=UTF-8
-```
-
-根 POM 里配的 `jvmArguments` 只对 `mvn spring-boot:run` 生效，**IntelliJ 走的是它自己的启动器，不会读它**。
-不加的后果是本机 JVM 默认 GBK，将来读文件时中文乱码。
-
-### 4. 验证（**别跳过这一步**）
+### 4. 验证（别跳过）
 
 ```bash
-curl -i http://127.0.0.1:8082/api/train/stations/VNP
-# 期望 200 + {"id":1,"stationCode":"VNP","stationName":"北京南","cityName":"北京",...}
-
-curl -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8082/api/train/stations/NOPE
-# 期望 404
-
-curl http://127.0.0.1:8082/api/train/stations
-# 期望 14 条车站
+curl -i http://127.0.0.1:8082/api/train/stations/VNP     # 期望 200 + 北京南
+curl -o /dev/null -w "%{http_code}\n" \
+     http://127.0.0.1:8082/api/train/stations/NOPE      # 期望 404
+curl http://127.0.0.1:8082/api/train/stations           # 期望 14 条车站
 ```
 
-> ⚠️ **停止服务不要只关掉 Maven。** `mvn spring-boot:run` 会 fork 出一个子 JVM，
-> 杀掉 Maven 进程后**子 JVM 仍占着 8082 端口**，下次启动会报
-> `Port 8082 was already in use`。要一并结束那个 `java.exe`：
->
-> ```bash
-> netstat -ano | grep ":8082.*LISTENING"     # 拿到 PID
-> taskkill //F //PID <PID>
-> ```
+> ⚠️ 停止服务不要只关掉 Maven。`spring-boot:run` 会 fork 一个子 JVM，杀掉 Maven 后它**仍占着 8082 端口**：`netstat -ano | grep ":8082.*LISTENING"` 拿到 PID，再 `taskkill //F //PID <PID>`。
 
 ---
 
-## 先读这个
+## 微服务列表（目标形态，方案 C）
 
-**[docs/architecture/phase0-design.md](docs/architecture/phase0-design.md)** —— 阶段 0 的唯一权威设计文档。
+当前仓库只有 `rail-train-service` 一个模块；下表的另外四个**都还不存在**，属于阶段 8 的拆分目标。
 
-文档中所有结论都用证据等级标注，**请严格区分**：
+| 服务 | 端口 | 职责 |
+| --- | --- | --- |
+| `rail-gateway` | 8080 | 统一入口、JWT 校验、限流 |
+| `rail-user-service` | 8081 | 注册、登录、用户查询 |
+| `rail-train-service` | 8082 | 车次、站点、经停站、票价 ← **当前唯一已实现的模块** |
+| `rail-inventory-service` | 8083 | 库存权威数据、预热、对账、回补落库、余票查询 |
+| `rail-order-service` | 8084 | 下单、秒杀、订单状态机、模拟支付 |
 
-| 标记 | 含义 |
-| --- | --- |
-| 🟢 已实测 | 在你本机实际执行命令得到的结论，可直接依赖 |
-| 🟡 调研结论 | 联网检索得到、附有出处，但**尚未在本机验证**，落地前必须实证 |
-| 🔵 架构判断 | 设计意见，含取舍理由，可以质疑 |
-| 🔴 待你拍板 | 必须你本人决定的事项 |
+**两条硬约束**（详见 [系统架构 §2](docs/02-architecture.md)）：
 
-**当前有 6 项 🔴 决策等待拍板**，见文档 §15。
+- 🔒 Redis 是**无主的共享预扣层**，`t_seat_inventory`（MySQL）才是权威数据。
+- ⛔ 秒杀热路径上**禁止 order-service 同步 Feign 调用 inventory-service**——order-service 直连 Redis。多一跳 RPC，会把异步化省下的时间原样还回去。
 
 ---
 
-## 技术栈（目标，非现状）
+## 技术栈
+
+**「已实测」= 在本机实际跑通过；「未接入」= 选型已定但还没进代码。**
 
 | 分类 | 组件 | 版本 | 状态 |
 | --- | --- | --- | --- |
-| 语言 | Java | 17.0.20.1 | 🟢 已实测（`D:\jdk-17.0.20.1`） |
-| 框架 | Spring Boot | 3.5.9 | 🟢 已实测（现有骨架） |
-| 框架 | Spring Cloud / Spring Cloud Alibaba | 2025.0.x / 2025.0.0.0 | 🟡 待实证 |
-| 注册中心/配置 | Nacos Server | 3.x | 🟡 待实证 |
-| 数据库 | MySQL | 8.4.8 | 🟢 已实测（含 JDBC 连通、时区配置，见 [案例 2](docs/troubleshooting/README.md)） |
-| 缓存 | Redis | 方案待定 | 🔴 见 §15 决策 1 |
-| 消息队列 | RocketMQ（推荐）/ RabbitMQ | 待定 | 🔴 见 §15 决策 2 |
-| ORM | MyBatis-Plus | 3.5.17 | 🟢 已实测（联网核实为 Central 最新版，且已跑通查询） |
-| 限流熔断 | Sentinel | 1.8.x | 🔴 见 §15 决策 6 |
-| 构建 | Maven | `mvnw` wrapper | 🟢 已实测（无独立 CLI） |
-| 压测 | JMeter | — | ❌ 待安装 |
-| 容器化 | Docker | — | ❌ **公司电脑无法安装，已放弃此路线** |
+| 语言 | Java | 17.0.20.1 | 🟢 已实测 |
+| 框架 | Spring Boot | 3.5.9（实测建议 3.5.16） | 🟢 已实测 |
+| ORM | MyBatis-Plus | 3.5.17 | 🟢 已实测 |
+| 数据库 | MySQL | 8.4.8 | 🟢 已实测（建表 + 约束验证） |
+| 缓存 | Redis | 8.10.1（第三方 Windows 移植版） | 🟢 基础命令与 Lua 已实测，**代码未接入** |
+| 注册中心 | Nacos Server | 3.2.3 | 🟢 可启动，**代码未接入**；端口已改为 8888/8889 |
+| 微服务框架 | Spring Cloud / Alibaba | 2025.0.x / 2025.0.0.0 | 🟡 版本已解析零冲突，未接入 |
+| 限流熔断 | Sentinel | 1.8.9 | 🔴 是否启用未定 |
+| 消息队列 | RocketMQ | 5.5.1 | 🟢 已装并跑通，🔴 **选型未拍板**，推迟到阶段 9 |
+| 构建 | Maven | 3.9.16（`mvnw` wrapper） | 🟢 已实测 |
+| 压测 | JMeter | 5.6.3 | 🟢 已装，**尚未发过请求** |
+| 容器化 | Docker | — | ❌ 公司电脑无法安装，**已放弃此路线** |
+
+> Docker 不可用是本项目的一等约束：MySQL、Redis、Nacos 全部以 Windows 原生方式安装，由此带来若干平台特有的坑（见 [技术栈 §6](docs/04-technology.md)）。
 
 ---
 
-## 架构流向（目标形态，方案 C）
+## 核心业务流程
+
+**一次购票（目标形态）**
 
 ```
-Client
-  │
-  ▼
-rail-gateway :8080          JWT 校验 · 限流 · 路由
-  │
-  ▼
-rail-order-service :8084 ──▶ Redis（Lua 原子预扣 + 用户去重）
-  │                              │
-  │ 立即返回「排队中」             │ 扣减成功
-  │                              ▼
-  │                            MQ（异步削峰）
-  │                              │
-  │              ┌───────────────┴───────────────┐
-  │              ▼                               ▼
-  │      order 消费者                       train 消费者
-  │      写 t_order                  写 t_seat_inventory
-  │              │                               │
-  └──────▶ rail-train-service :8082 ◀────────────┘
-                  ▲                （余票权威数据）
-                  │
-           rail-user-service :8081
+用户下单 → 校验（车次/余票/限购）→ Redis Lua 原子预扣库存
+        → 订单落库（待支付）→ 立即返回 → 异步写 MySQL 库存
+        → 支付 → 订单状态 0→1
+        → 超时未付 → 状态 0→2 并回补库存
 ```
 
-**关键设计**：Redis 库存是**无主的共享预扣层**，MySQL 的 `t_seat_inventory` 才是权威数据。
-秒杀热路径上**不做同步的跨服务 HTTP 调用**——唯一的同步远程调用是 Redis。
+**订单状态机（以真实 DDL 为准）**
 
-详见 [阶段 0 设计文档](docs/architecture/phase0-design.md)。
+```
+0 待支付 ──支付──▶ 1 已支付
+   │
+   └──超时/取消──▶ 2 已取消
+```
 
----
+状态迁移**一律用条件 UPDATE（CAS）**，不用分布式锁。注意：**没有 FAILED 状态**——早期设计稿里那个状态在真实建表脚本中不存在。
 
-## 开发路线图
+**秒杀链路的关键取舍**：异步化省下的时间不能被 RPC 吃掉，所以热路径只有「Redis 一次往返 + 一次消息投递」。
 
-| 阶段 | 名称 | 完成判据 |
-| --- | --- | --- |
-| 0 | 需求与架构设计 | ✅ 已完成 → [设计文档](docs/architecture/phase0-design.md) |
-| 1 | 环境搭建 | ✅ 已完成，**每个中间件都有实测验证证据**（见上方表格） |
-| 2 | 数据库设计 | ✅ 已完成：9 张表建好，**约束行为已用违规数据实测** |
-| 3 | 项目初始化 | ✅ 已完成：`rail-train-service` 启动后 `curl` 到 `t_station` 的**真实数据**（14 行），404 分支也验证过 |
-| 4 | 核心业务（单体） | 查询接口全部走通 |
-| 5 | 购票 + MySQL 库存（方案 A） | **并发测试证明不超卖** |
-| 6 | 压测 v1 | 有真实瓶颈数据 |
-| 7 | 引入 Redis（方案 B） | 与阶段 6 对比有量化提升 |
-| 8 | 微服务拆分 | 跨服务调用通，服务下线可感知 |
-| 9 | 引入 MQ（方案 C） | 9 条异常路径逐条实测 |
-| 10 | 压测 v2 + 优化 | 完整的优化前后对比 |
-| 11 | 复盘 + 面试化 | 能不看文档讲 30 分钟 |
-
-> **为什么方案 A → B → C 要分阶段走，而不是直接写最终形态**：
-> 如果直接写方案 C，你永远无法回答面试官那句最致命的追问——"**如果不加 Redis 会怎么样？**"
-> 只有亲手在阶段 6 压出 `Lock wait timeout` 的真实数字，那个答案才是你自己的。
+详细流程、方案 A/B/C 的对比与验收标准 → [业务流程](docs/03-business-flow.md)、[秒杀与库存](docs/05-seckill.md)
 
 ---
 
-## AI-Assisted Development
+## 文档入口
+
+**项目介绍与阅读入口**见 [docs/01-project-guide.md](docs/01-project-guide.md)（**不含开发状态**）。
+
+| 文档 | 回答什么问题 |
+| --- | --- |
+| [01 项目阅读指南](docs/01-project-guide.md) | 这是什么项目、整体架构、目录结构、核心流程、技术全景 |
+| [02 系统架构](docs/02-architecture.md) | 三套候选架构怎么选、为什么拆 5 个服务、服务挂了会怎样 |
+| [03 业务流程](docs/03-business-flow.md) | 功能边界、订单状态机、验收标准 |
+| [04 技术栈与选型](docs/04-technology.md) | 版本矩阵、端口规划、环境搭建、本机特有的三个坑 |
+| [05 秒杀与库存](docs/05-seckill.md) | 不超卖的三道防线、Lua 脚本、幂等、MQ 异常路径矩阵 |
+| [06 数据库设计](docs/06-database.md) | 表设计决策、不超卖的数据库侧防线、验证证据 |
+| [07 风险与已知缺陷](docs/07-risks.md) | 会在哪里出问题、本设计已知没解决的地方 |
+| [开发状态](docs/status/development-status.md) | **做到哪了**、技术债、下一步 |
+| [ADR 决策记录](docs/decisions/) | 单个架构决策的完整权衡过程 |
+| [真实踩坑记录](docs/troubleshooting/README.md) | **实际发生过**的故障，每篇都有原始日志 |
+
+### 标记约定
+
+文档中的结论一律用证据等级标注，**请严格区分**：
+
+| 标记 | 含义 |
+| --- | --- |
+| 🟢 已实测 | 在本机实际执行命令得到的结论，可直接依赖 |
+| 🟡 调研结论 | 检索得到、附有出处，但**尚未在本机验证**，落地前必须实证 |
+| 🔵 架构判断 | 设计意见，含取舍理由，可以质疑 |
+| 🔴 待拍板 | 必须由开发者本人决定的事项 |
+
+**本项目不包含任何未经实测的性能数字。** 所有 🟡 结论都必须在本机验证后才能转为 🟢。
+
+---
+
+## AI 辅助开发
 
 这个项目刻意采用 AI 辅助开发流程，并把它作为能力的一部分。
 
 | 环节 | AI 的角色 | 人的角色 |
 | --- | --- | --- |
-| 需求分析 | 拆解需求、发现规格缺口（如"有出发/到达站需求但没有经停站表"） | 确认范围边界 |
-| 架构方案讨论 | 并行产出多套候选方案、联网核实版本兼容性、**对抗性验证**（专门尝试推翻自己的设计） | **做最终决策** |
-| 代码生成 | 按设计生成实现与教学注释 | 逐段理解、拒绝不理解的代码 |
-| Debug | 辅助定位与解释根因 | 复现问题、验证修复 |
-| 测试设计 | 设计并发测试与异常路径用例 | 执行并确认结果 |
-| Code Review | 审查一致性、并发正确性 | 决定是否采纳 |
-| 性能分析 | 分析压测数据的可能瓶颈 | **执行压测、确认数据真实性** |
-| 文档整理 | 结构化文档、沉淀 ADR | 审核准确性 |
+| 需求分析 | 拆解需求、发现规格缺口 | 确认范围边界 |
+| 架构方案讨论 | 并行产出候选方案、核实版本兼容性、**对抗性验证** | **做最终决策** |
+| 代码 / 测试 | 按设计生成实现，设计并发与异常用例 | 逐段理解、拒绝不理解的代码，执行并确认真实结果 |
+| Debug / 性能 | 辅助定位根因、分析压测数据的可能瓶颈 | 复现问题、**执行压测、确认数据真实性** |
 
-> **明确声明**：**关键技术决策、代码验证、性能测试和最终结果由开发者本人确认。**
-> 本仓库不包含任何未经实测的性能数字。所有 🟡 标记的结论都必须在本机验证后才能转为 🟢。
+> **明确声明**：关键技术决策、代码验证、性能测试和最终结果由开发者本人确认。
 
-### 一次真实的 AI 协作失败（已记录）
+**一次真实的协作失败（已记录）**：阶段 0 的首次多代理工作流中，综合与修正环节被安全分类器拦截，导致设计规格为空，而后续 8 个文档代理在**没有规格**的情况下各自生成内容，产出 **3 套互不兼容的服务拆分方案**和**互相矛盾的 MQ 选型结论**。这些草稿已于 2026-09-29 的文档整理中全部删除（原始文件仍在 git 历史里，恢复方式与内容比对见 [开发状态 §6](docs/status/development-status.md)）。
 
-阶段 0 的首次多代理工作流**部分失败**：综合与修正环节被安全分类器拦截，导致最终设计规格为空，
-而后续 8 个文档代理在**没有规格**的情况下各自生成内容，产出了 **3 套互不兼容的服务拆分**和**互相矛盾的 MQ 选型**。
-
-处理方式：全部隔离至 `docs/_drafts-unverified/`，由人工重新编写权威文档。
-**教训**：AI 生成的架构文档必须做**跨文档一致性检查**，且不能想当然地把"生成成功"当作"内容正确"。
-
----
-
-## 文档目录约定
-
-| 目录 | 放什么 |
-| --- | --- |
-| `docs/architecture/` | 系统架构、服务拆分、高并发风险清单 |
-| `docs/database/` | 表设计、索引理由、校验 SQL |
-| `docs/api/` | 接口定义、错误码规范 |
-| `docs/decisions/` | **ADR（架构决策记录）**，格式：背景 / 决策 / 备选对比 / 理由 / 代价 / 什么条件下失效 |
-| `docs/troubleshooting/` | **真实问题记录**（当前 2 例），必须含真实日志，禁止编造 |
-| `docs/performance/` | 压测计划与**实测报告**，禁止编造数据 |
-| `docs/interview/` | 面试问题库与追问链 |
+**教训**：AI 生成的架构文档必须做**跨文档一致性检查**，不能把「生成成功」当作「内容正确」。

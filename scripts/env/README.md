@@ -140,68 +140,23 @@ Windows 上开始菜单、任务栏、桌面都由 `explorer.exe` 托管，**从
 
 ### 6.2 平台默认编码是 GBK（重要）
 
-`./mvnw -v` 输出里有一行：
+`./mvnw -v` 输出里的 `Default locale: zh_CN, platform encoding: GBK` 意味着 **JVM 的 `file.encoding` 是 GBK 而不是 UTF-8**（Java 17 尚未默认 UTF-8，那是 JDK 18 的 JEP 400）。已完成处理：根 POM 显式声明编码属性，并给 `spring-boot-maven-plugin` 配了 `-Dfile.encoding=UTF-8`。
 
-```
-Default locale: zh_CN, platform encoding: GBK
-```
-
-这意味着 **JVM 的 `file.encoding` 是 GBK 而不是 UTF-8**。Java 17 尚未默认 UTF-8（那是 JDK 18 的 JEP 400）。
-
-**影响面评估**：
-
-| 场景 | 是否受影响 | 说明 |
-| --- | --- | --- |
-| Maven 编译 Java 源码 | 🟢 **不受影响** | `spring-boot-starter-parent` 已把 `project.build.sourceEncoding` 设为 UTF-8，`maven-compiler-plugin` 会显式传 `-encoding UTF-8` |
-| Spring Boot 读 `application.yml` | 🟢 **不受影响** | Spring Boot 显式按 UTF-8 读取配置 |
-| **自己写 `FileReader` / `Files.readString` 不指定字符集** | 🔴 **会乱码** | 这是**默认字符集陷阱**，将来读 Lua 脚本、JSON 测试数据时必须显式传 `StandardCharsets.UTF_8` |
-| 控制台中文日志 | 🟡 可能乱码 | 取决于终端编码（Git Bash 是 UTF-8，CMD 默认 GBK） |
-
-**处理方案**（阶段 3 项目初始化时落地）：
-
-```xml
-<properties>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-</properties>
-...
-<plugin>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-maven-plugin</artifactId>
-    <configuration>
-        <jvmArguments>-Dfile.encoding=UTF-8</jvmArguments>
-    </configuration>
-</plugin>
-```
-
-以及代码规范：**任何字符流读写一律显式指定 `StandardCharsets.UTF_8`，禁止依赖平台默认值。**
+**完整的影响面评估、处理方案与代码规范见 [docs/04-technology.md §6.1](../../docs/04-technology.md)。**
 
 ### 6.3 公司 DLP 会加密「没有扩展名」的文件（重要）
 
-这台办公机装了亚信安全 DLP。实测行为：**「扩展名不在白名单内」+「由受管控进程写入」两个条件同时成立时，文件被透明加密**——文件头变成 `%TSD-Header-###`，体积被撑到 8192 字节的容器。
+实测行为：**「扩展名不在白名单内」+「由受管控进程写入」两个条件同时成立时，文件被透明加密**——文件头变成 `%TSD-Header-###`，体积被撑到 8192 字节的容器。**它对编辑器完全透明**，但 `git.exe` 读到的是磁盘原始密文，**全程不报任何错**。
 
-最坑的地方是**它对编辑器完全透明**：在编辑器里看是正常明文，但 `git.exe` 读到的是磁盘原始密文，会把一坨二进制当文件内容提交上去，**全程不报任何错**。
+`.gitignore` 恰好是整个工程里唯一一个「必须没有扩展名」的文件，第一次提交时忽略规则**一条都没生效**（`git add -A` 暂存了 54 个文件）。
 
-`.gitignore` 恰好是整个工程里唯一一个「必须没有扩展名」的文件，第一次提交时就被它坑了——`git add -A` 暂存了 **54** 个文件，忽略规则**一条都没生效**。
-
-严重性不在功能，而在**静默**：`.gitignore` 里有 `**/application-local.yml` 这条规则，规则失效就意味着**本机真实数据库密码会被正常提交**，而且它在仓库里是二进制乱码，review 时没人会点开看。
-
-| 类型 | 处理方式 |
-| --- | --- |
-| 带扩展名的文件（已实测安全：`.md` `.sql` `.sh` `.ps1` `.txt` `.lua` `.json` `.xml` `.yml` `.java` `.properties`） | ✅ 明文，正常写就行 |
-| **无扩展名的文件**（`.gitignore`、将来的 `Dockerfile` / `LICENSE`…） | 🔒 **禁止用编辑器直接保存**——保存动作本身就会触发加密。必须用 bash 生成 |
-
-用 bash 生成（bash 不在 DLP 的受管控进程名单里，写入落盘即明文）：
+**处理规则**：无扩展名的文件（`.gitignore`、将来的 `Dockerfile` / `LICENSE`…）**禁止用编辑器保存**——保存动作本身就会触发加密，必须用 bash 生成（bash 不在 DLP 的受管控进程名单里）：
 
 ```bash
 cat > .gitignore <<'EOF'
 ...内容...
 EOF
 ```
-
-或从一份带扩展名的暂存副本拷过来：`cp gitignore.txt .gitignore`
-
-**注意：不要用编辑器「重新保存」已修复的文件**，那会把它重新加密回 8192 字节。
 
 提交前守卫（挂了 pre-commit 钩子就自动跑）：
 
@@ -212,7 +167,7 @@ bash scripts/env/check-dlp-encryption.sh
 
 > 为什么守卫必须用 bash 写：它要和 **git 用相同的读取方式**（读磁盘原始字节）。用一个会被 DLP 解密的白名单工具去检查加密文件，看到的是明文——**那样的检查是自欺欺人**。
 
-完整排查过程（含控制变量实验设计）见 [docs/troubleshooting/README.md 案例 1](../../docs/troubleshooting/README.md)。
+完整背景与排查过程（含控制变量实验设计）见 [docs/04-technology.md §6.3](../../docs/04-technology.md) 与 [docs/troubleshooting/README.md 案例 1](../../docs/troubleshooting/README.md)。
 
 ---
 
