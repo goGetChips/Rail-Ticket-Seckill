@@ -43,6 +43,7 @@
 | MySQL 驱动 | **9.7.0** | 🟢 由 Boot 3.5.16 管理版本（当前 3.5.9 对应 9.5.0） |
 | Nacos Server | 3.x | 🟡 客户端锁 3.0.3，**服务端不要盲目上最新** |
 | springdoc-openapi | 2.8.x | 🟡 待验证（Boot 3.x 必须用 2.8.x 线） |
+| JUnit 5 / AssertJ | 随 Boot 3.5.9 管理 | 🟡 **阶段 5 才开始用**（`src/test` 目录与 2 个测试类已写好，**尚未运行**）。版本**不由我们决定**，`spring-boot-starter-test` 传递引入 |
 
 ### 2.1 这次验证解决了什么
 

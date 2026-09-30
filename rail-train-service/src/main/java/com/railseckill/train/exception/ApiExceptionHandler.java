@@ -9,8 +9,12 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.lang.Nullable;
+import org.springframework.validation.FieldError;
+import org.springframework.validation.ObjectError;
 import org.springframework.validation.method.ParameterValidationResult;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
@@ -92,16 +96,64 @@ import java.util.List;
  *      这就是为什么 pom.xml 里那个依赖的注释特地写了"缺失是静默失效"。
  *
  * =============================================================================
- *  【为什么这里没有一长串 @ExceptionHandler 处理业务异常】
+ *  ⭐ 【阶段 4 的这句话在阶段 5 到期了】
  * =============================================================================
- *   因为**当前没有任何业务异常**。
- *   阶段 4 的接口全是查询：查不到就是 404（用 ResponseEntity.notFound 表达，
- *   不是抛异常），参数非法就是 400（校验抛出）。
- *   没有"余额不足""重复下单"这类需要业务语义的错误 —— 那些属于阶段 5+。
+ *   本类原先写着：
  *
- *   一旦有了，正确的做法是定义业务异常类型再在这里加 @ExceptionHandler，
- *   而不是现在先摆几个空的 handler 等着。**空 handler 会让人以为
- *   那些异常已经被处理了。**
+ *     「这里没有一长串 @ExceptionHandler 处理业务异常，因为当前没有任何业务异常。
+ *       一旦有了，正确的做法是定义业务异常类型再在这里加 @ExceptionHandler，
+ *       而不是现在先摆几个空的 handler 等着。**空 handler 会让人以为
+ *       那些异常已经被处理了。**」
+ *
+ *   阶段 5 有了：下单会遇到"未放票 / 售罄 / 重复购票"，
+ *   支付会遇到"订单不存在 / 订单已取消"。
+ *   所以下面**真的**加了 handler —— 不是提前摆的架子，是有异常要接。
+ *
+ *   这个演进顺序本身是有示范意义的：**先有异常，再有 handler**。
+ *   反过来（先铺好各种 handler）的问题是，你会分不清
+ *   "这个分支处理过了" 和 "这个分支没人走过"。
+ *
+ * -----------------------------------------------------------------------------
+ *  ⭐ 【为什么业务异常的 handler 什么都不做，只是交回 handleExceptionInternal】
+ * -----------------------------------------------------------------------------
+ *   看下面那个 handleBusinessException —— 它一行判断都没有。
+ *   这是刻意的：它存在的唯一目的是**把异常类型和 HTTP 状态码接上**，
+ *   至于响应体怎么造、日志怎么打，全部沿用上面那个已经写好并验证过的路径。
+ *
+ *   如果在这里自己 `new ResponseEntity<>(...)`：立刻就有了**第二个**
+ *   ApiError 构造点。两处的 error / message / details 取值规则
+ *   这次可能一致，下次改一处漏一处就会分叉 ——
+ *   而症状是"同一个 409，从不同分支出来的响应体长得不一样"。
+ *
+ *   顺带一个好处：日志分档自动沿用（409 < 500 → log.debug），
+ *   符合"业务失败不是告警"这条判断，不需要在这里再写一次。
+ *
+ * -----------------------------------------------------------------------------
+ *  ⚠️ 【新增 @ExceptionHandler(Exception.class)：这是一处**响应体行为变更**】
+ * -----------------------------------------------------------------------------
+ *   阶段 5 之前，这个类没有兜底 handler，所以任何"意想不到的异常"
+ *   都会落到 Spring Boot 的默认 `/error` 上，返回：
+ *
+ *       {"timestamp":"...","status":500,"error":"Internal Server Error","path":"..."}
+ *
+ *   而本项目其他所有错误响应都是 ApiError 的形状：
+ *
+ *       {"status":500,"error":"...","message":"...","details":[...]}
+ *
+ *   **两种形状**意味着前端要写两套解析逻辑，而且更麻烦的是：
+ *   那条路径**不经过本类的日志**，所以监控抓不到 ——
+ *   "接口返回了漂亮的 JSON"会掩盖"服务其实坏了"。
+ *
+ *   为什么阶段 5 才补：阶段 5 起，"扣减抛异常 = 系统失败、结果未知"
+ *   第一次成为真实可能的结局（见 sql/03_rail_inventory.sql 的 (c) 情形）。
+ *   在此之前所有失败都是可枚举的 400/404/405。
+ *
+ *   ⚠️ **代价（诚实写出来）**：500 的响应体形状变了，文档要同步。
+ *      这条改动会影响所有接口，不只是新接口。
+ *
+ *   ⚠️ 【它不会抢走更具体的 handler】Spring 按异常类型**最具体者胜出**：
+ *      MethodArgumentNotValidException 会走继承来的那个 handler（400），
+ *      不会掉进这个 Exception 兜底。这一点是机制保证的，不是巧合。
  * =============================================================================
  */
 @RestControllerAdvice
@@ -163,11 +215,72 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     /**
+     * 业务失败 —— 未放票 / 售罄 / 重复购票 / 订单状态不允许 / 订单不存在。
+     *
+     * <p>方法体刻意只有一行：把异常交回 {@link #handleExceptionInternal}。
+     * 理由见类注释里"为什么业务异常的 handler 什么都不做"。
+     *
+     * <p>状态码来自 {@link BusinessException#getStatus()} ——
+     * 所以"加一个新的业务失败场景"只需要新建一个异常类，
+     * **不需要回来改这个文件**。
+     *
+     * <p>第二个参数传 {@code null} 是照抄继承来的那些 handler 的约定：
+     * body 为 null 表示"响应体由 handleExceptionInternal 自己造"。
+     */
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<Object> handleBusinessException(BusinessException ex, WebRequest request) {
+        return handleExceptionInternal(ex, null, HttpHeaders.EMPTY, ex.getStatus(), request);
+    }
+
+    /**
+     * 兜底：任何没被更具体的 handler 接住的异常 → 500。
+     *
+     * <p>存在的意义是让 5xx 也长成 {@link ApiError} 的样子，
+     * 并且**经过本类的日志**（500 走 log.warn + 完整堆栈，监控才抓得到）。
+     *
+     * <p>⚠️ 它接住的异常意味着"服务端有 bug 或依赖故障"，
+     * 所以响应体里**不能**透出异常原文 —— {@link #message} 只给一句话，
+     * 完整堆栈进日志。
+     */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Object> handleUnexpectedException(Exception ex, WebRequest request) {
+        return handleExceptionInternal(ex, null, HttpHeaders.EMPTY,
+                HttpStatus.INTERNAL_SERVER_ERROR, request);
+    }
+
+    /**
      * 面向调用方的一句话说明。
      *
      * <p>刻意只给"这一类错误是什么"，不拼接异常原文 —— 原因见方法上方的日志说明。
      */
     private String message(Exception ex, HttpStatusCode statusCode) {
+        /*
+         * ---- 业务失败：用异常**自己**的 message ----
+         *
+         * ⚠️ 这是本方法里唯一一条"把异常原文透给调用方"的分支，
+         * 所以它是**有前提的**：前提是 BusinessException 的 message
+         * 由我们自己写（"该席别已售罄"），而不是从底层异常透传上来的。
+         *
+         * 这正是为什么 BusinessException 的构造器注释里强调
+         * "不要写内部术语、不要拼 SQL" —— 那句话约束的正是这里。
+         * 如果哪天有人把 `new SeatNotAvailableException(..., ex.getMessage())`
+         * 这样用，SQL 原文就会从这里漏出去。**约束靠构造点自觉，不靠这里过滤。**
+         */
+        if (ex instanceof BusinessException businessException) {
+            return businessException.getMessage();
+        }
+
+        /*
+         * ---- @Valid @RequestBody 校验失败（阶段 5 新增的路径）----
+         *
+         * 和 HandlerMethodValidationException 返回**同一句话**是刻意的：
+         * 从调用方的角度，"查询参数不合法"和"请求体字段不合法"
+         * 是同一类错误（你传的数据不符合要求），没必要让它去分辨。
+         */
+        if (ex instanceof MethodArgumentNotValidException) {
+            return "请求参数校验未通过";
+        }
+
         if (ex instanceof HandlerMethodValidationException) {
             return "请求参数校验未通过";
         }
@@ -181,7 +294,19 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
             case 400 -> "请求格式不正确";
             case 404 -> "请求的资源不存在";
             case 405 -> "请求方法不被支持";
-            case 415 -> "不支持的请求内容类型";
+            /*
+             * 409 这一条是阶段 5 补的。
+             *
+             * ⚠️ 它**基本走不到** —— 因为 409 在当前项目里只有一个来源
+             * （BusinessException），而上面那个分支已经把 message 接走了。
+             * 留着它是防御性的：哪天有个不走 BusinessException 的 409
+             * （比如 Spring 自己在某个场景抛 Conflict），
+             * 至少不会退化成"请求处理失败"这种什么也没说的话。
+             *
+             * 这不算"为不存在的问题写代码"：它不是一段行为建模，
+             * 只是 switch 的一个分支，而且 cost 只有一行。
+             */
+            case 409 -> "业务规则不允许该操作";
             default -> "请求处理失败";
         };
     }
@@ -193,6 +318,71 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
      * 会让前端写 {@code details.map(...)} 时抛异常，而 {@code []} 天然安全。
      */
     private List<String> details(Exception ex) {
+        /*
+         * ---- 情况 0：业务失败自带的定位信息（阶段 5）----
+         *
+         * 注意这里**不是**"逐字段的校验原因"，而是"这次失败针对的是哪趟车哪天"。
+         * 区别见 BusinessException#getDetails 的注释。
+         */
+        if (ex instanceof BusinessException businessException) {
+            return businessException.getDetails();
+        }
+
+        /*
+         * ---- 情况 0.5：@Valid @RequestBody 校验失败（阶段 5 新增）----
+         *
+         * 🔴 【这一条是必须主动补的洞，而且它是同一类 bug 的第二次出现】
+         *
+         * 在本类最初的版本里，details() 没有这个分支，于是 @Valid 失败会
+         * 一路走到最后的 `return List.of()` —— 响应体变成：
+         *
+         *     {"message":"请求参数校验未通过","details":[]}
+         *
+         * 调用方**看不出是哪个字段错了**。而 docs/api/error-codes.md §三②
+         * 已经记录过一次同类事故：缺必填查询参数时 details 是空的，
+         * 只能在一堆必填参数里猜。这是第二次。
+         *
+         * ⭐ 为什么这两个分支当初都没想到：
+         *   因为它们都**依赖一个新的入口机制**（第一次是
+         *   MissingServletRequestParameterException，这次是 @Valid），
+         *   而 details() 是"按异常类型分流"的，新增机制就必须新增分支。
+         *   **这个方法的维护成本随入口机制的数量增长，不随字段数量增长** ——
+         *   所以判据是"有没有引入新的校验入口"，不是"有没有新增字段"。
+         *
+         * ⚠️⚠️ 【必须用 getAllErrors()，不能用 getFieldErrors()】
+         *   getAllErrors() = getFieldErrors()（字段级）+ getGlobalErrors()（类级）。
+         *
+         *   类级约束指的是**写在类上、跨字段**的校验，比如：
+         *       @AssertTrue(message = "上车日期不能晚于下车日期")
+         *       public boolean isDateRangeValid() { ... }
+         *   或者自定义的类级 @Constraint。
+         *
+         *   只遍历 getFieldErrors() 会把它们**静默丢掉** ——
+         *   失败发生了（所以确实是 400），但 details 是空的，
+         *   于是又退化成上面那个"只报错不说是哪错"的状态。
+         *   用 getAllErrors() 之后，字段级和类级都能显示，
+         *   类级错误的"字段名"用 objectName 兜底（通常是类名）。
+         *
+         *   本项目现在还没有类级约束 —— 但用 getAllErrors() 的代价是零，
+         *   而等到真加了类级约束时，这里不会有人想起来要改。
+         */
+        if (ex instanceof MethodArgumentNotValidException notValidException) {
+            List<String> details = new ArrayList<>();
+            for (ObjectError error : notValidException.getBindingResult().getAllErrors()) {
+                /*
+                 * FieldError 是字段级错误（有具体字段名），
+                 * 其余（如 ObjectError）是类级错误，没有字段名可用 ——
+                 * 用 objectName（通常是那个类的名字）作为退而求其次的定位。
+                 */
+                String location = (error instanceof FieldError fieldError)
+                        ? fieldError.getField()
+                        : error.getObjectName();
+                String reason = error.getDefaultMessage();
+                details.add(location + ": " + (reason != null ? reason : "取值不合法"));
+            }
+            return details;
+        }
+
         // ---- 情况 1：@RequestParam 上的约束校验失败（阶段 4 的主路径）----
         if (ex instanceof HandlerMethodValidationException validationException) {
             List<String> details = new ArrayList<>();

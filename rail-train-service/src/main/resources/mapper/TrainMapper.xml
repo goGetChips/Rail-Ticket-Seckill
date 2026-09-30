@@ -3,26 +3,6 @@
         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 
 <!--
-  =============================================================================
-   TrainMapper 的 SQL
-  =============================================================================
-
-   ⚠️ namespace 必须**精确等于** Mapper 接口的全限定名。
-      拼错（比如少一个包名）不会在启动时报错，只在第一次调用那个方法时抛：
-
-          org.apache.ibatis.binding.BindingException:
-          Invalid bound statement (not found): com.railseckill.train.mapper.TrainMapper.selectTrainPage
-
-      这个报错信息里的 "not found" 很容易被误解成"接口方法没找到"，
-      实际是"XML 里的 statement id 和接口方法对不上"。
-      排查方向是检查 namespace 和方法名，不是检查接口有没有写。
-
-   ⚠️ 本文件在 src/main/resources/mapper/ 下，被 application.yml 里的
-      mybatis-plus.mapper-locations 扫到（那个配置值本来就是默认值）。
-
-   ⚠️ **反斜杠和转义**：XML 里 `<` 必须写成 `&lt;`（否则被当成标签开始）。
-      下面的自连接查询就踩到这一条。
-
    =============================================================================
     ⭐⭐ 关于三个 <resultMap>：为什么必须显式写 <constructor>
    =============================================================================

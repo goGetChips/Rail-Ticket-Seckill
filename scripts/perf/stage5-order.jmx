@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+   阶段 5 并发测试：50 线程抢同一趟车同一天同一席别的票
+  ============================================================================
+
+   这个脚本回答的问题：**真实 HTTP 层并发下单时，会不会超卖？**
+
+   它和 JUnit 的 OrderConcurrencyTest 是**交叉验证**，不是重复劳动：
+
+     OrderConcurrencyTest    直接调 OrderService，100 线程 → 判定"恰 20 成功"
+                             绕过 Tomcat、Jackson、@Valid、HTTP 连接池
+     本脚本                   走真实 HTTP，50 线程
+                             **经过** Tomcat 线程池、Jackson 反序列化、
+                             @Valid 校验、HTTP 连接池 —— 这些是 JUnit 绕过的部分
+
+   两条路都通，结论才是"这个接口在并发下不超卖"，而不是"这个方法不超卖"。
+
+   ===========================================================================
+   ⚠️⚠️ 跑之前必须先造库存 fixture（本脚本**不能**自己造）
+   ===========================================================================
+   下单要求当天那一行 t_seat_inventory 存在，否则全部返回 409「尚未放票」——
+   脚本会显示 100% 失败，而那不是 bug，是没造数据。
+
+   ⚠️ 日期用的是 CURDATE() + 70 天（见下面的 __timeShift P70D），
+      所以 fixture 也必须造在这一天。
+
+      ⭐ fixture 的 SQL **抄 sql/12_verify_stage5_order.sql 文末的
+         「fixture 的创建与清理」那一段** —— 那里有可直接粘贴的完整语句
+         （包括 mysql 命令行的全部参数）。不在这里重复一遍，
+         是因为两处各存一份 SQL 就一定会分叉，
+         而分叉的症状是"脚本用的日期和 fixture 造的日期不是同一天"，
+         跑出来 100% 失败却看不出为什么。
+
+      ⭐ 要求就两条，缺一不可：
+         · total_count = 20   ← 本次要抢的票数
+         · sold_count  = 0    ← **必须是 0**，
+           这样"库存增量"才等于"本应用卖出的票数"，
+           跑完才对得上账（非 0 的话你分不清那几张是谁卖的）
+
+   ⚠️ 日期为什么要 +70 天，而不是用种子数据：
+      sql/11_seed_inventory.sql 放的是"执行它那天"的 +1/+2/+3 天，
+      过几天就变成过去的日期了，@FutureOrPresent 会直接拒绝。
+      +70 是**当场算**的，什么时候跑都成立。
+
+   ⚠️ 为什么 +70 而不是 +60 / +55：
+      JUnit 的两个测试类分别用 +60 和 +55（见 OrderServiceIT /
+      OrderConcurrencyTest 里的 TEST_DATE）。三者错开，
+      **三个测试可以同时跑而不会互相踩 fixture**。
+
+   ===========================================================================
+   ⭐ 判读规则
+   ===========================================================================
+     响应码只可能是 200 或 409，**两者都是"对"的**：
+       200 → 抢到了
+       409 → 没抢到（售罄）
+
+     ⚠️ 所以"错误率 0%"的含义是"没有出现 200/409 之外的响应"，
+        **不是**"所有请求都成功了"。
+
+     期望错误率：0%（所有响应都是 200 或 409）
+
+     而"**恰好 20 个 200 / 30 个 409**"这件事 **不靠 JMeter 数**，
+     靠 SQL 数 —— 见下面「跑完之后必须做的两个检查」。
+
+   ===========================================================================
+   ⚠️ 【为什么"恰好 20 个"不靠 JMeter 数】
+   ===========================================================================
+     JMeter 能给出错误率、吞吐量，但把它当作"卖了几张"的证据有三个问题：
+       1. 聚合报告按 label 分组。所有请求同一个 label 时，
+          报告里只有一行"50 个请求"，不告诉你几个 200、几个 409
+       2. JMeter 的计数是**客户端侧**的。客户端收到 200 不等于
+          服务端真的提交了（虽然概率极低，但"账"必须以数据库为准）
+       3. 一旦响应超时，JMeter 记的是"失败"，而服务端可能已经成功了
+
+     ⭐ 判据必须落在数据库里 —— 这是阶段 5 的最基本原则：
+       **线程内部的计数（或者 HTTP 客户端的计数）不算证据，库里的数字才算。**
+
+     （本脚本尝试过用 JSR223 后置处理器把采样器的 label 改成
+      "下单-200" / "下单-409" 来让聚合报告分组。见下面那段注释里的
+      ⚠️ 待验证说明 —— 它只是**便于阅读**的加分项，
+      判据完全不依赖它。）
+
+   ===========================================================================
+   ⚠️ 50 线程 ≠ 50 并发
+   ===========================================================================
+     应用的 HikariCP 连接池**默认最大 10 条连接**（application.yml 没改它，
+     刻意如此 —— 池大小是阶段 6 要压测的变量，现在改会把基准线弄脏）。
+     所以实际同时执行数据库事务的只有约 10 个，其余在线程池/连接池里排队。
+
+     ⭐ **这不是脚本的问题，也不需要修**。它说明的是：
+       本脚本证明的是"**10 个数据库并发事务下不超卖**"。
+       想把并发度提上去，先改 application.yml 里的池大小 ——
+       而那属于阶段 6 的事（那时也才有"改之前/改之后"的对照）。
+
+   ===========================================================================
+   跑完之后必须做的两个检查（都在 sql/12_verify_stage5_order.sql 里）
+   ===========================================================================
+     ① 库存恰好被扣掉 20：
+        SELECT sold_count, total_count FROM rail_inventory.t_seat_inventory
+         WHERE train_id=(SELECT id FROM rail_train.t_train WHERE train_no='G1')
+           AND travel_date = CURDATE() + INTERVAL 70 DAY AND seat_type = 1;
+        → 期望 sold_count = 20，total_count = 20
+
+     ② 订单数也恰好是 20（**两个数必须一致，这是不超卖也不少卖的核心证据**）：
+        SELECT COUNT(*) FROM rail_order.t_order
+         WHERE user_id BETWEEN 9300000 AND 9399999;
+        → 期望 20
+
+     ⚠️ 如果 ① 是 20 而 ② 是 19，说明**少卖**了：
+        有一次扣减提交了但没有订单落库。最可能的原因是
+        OrderService 的 catch 块里写了 return 而不是 throw
+        （Spring 会把事务提交）。完整论证见 OrderService 的类注释。
+
+   ===========================================================================
+   怎么跑
+   ===========================================================================
+     ⚠️ jmeter.bat 里调的是裸 `java`，**它不读 JAVA_HOME**，
+        所以必须先把 java 放进 PATH（本机 PATH 里没有）：
+
+       export JAVA_HOME="D:/jdk-17.0.20.1"
+       export PATH="/d/jdk-17.0.20.1/bin:$PATH"
+       "D:/dev_tools/apache-jmeter-5.6.3/bin/jmeter.bat" -n \
+         -t scripts/perf/stage5-order.jmx -l /tmp/stage5.jtl
+
+     ⚠️ **不记录任何时延数字。** 本阶段的 mapper 日志还开着 debug，
+        测出来的响应时间没有意义。时延基准线是阶段 6 的事，
+        而且必须先在阶段 6 把日志级别调回 info 之后再测。
+        本脚本的 jtl 里有 latency 字段 —— **不要把它抄进文档。**
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="阶段 5 并发下单（50 线程抢 20 张票）">
+      <stringProp name="TestPlan.comments">50 线程各下一单，期望 20 个 200 + 30 个 409；判据以数据库为准</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">127.0.0.1</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">8082</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="TRAIN_NO" elementType="Argument">
+            <stringProp name="Argument.name">TRAIN_NO</stringProp>
+            <stringProp name="Argument.value">G1</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="SEAT_TYPE" elementType="Argument">
+            <stringProp name="Argument.name">SEAT_TYPE</stringProp>
+            <stringProp name="Argument.value">1</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 请求默认值">
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.protocol">http</stringProp>
+        <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">5000</stringProp>
+        <!--
+          ⚠️ 响应超时给 30 秒：应用侧连接池只有 10 条，
+             50 个请求里有 40 个会先排队等连接。
+             超时设太小会让"排队"表现为"失败"，而排队是设计内的行为。
+        -->
+        <stringProp name="HTTPSampler.response_timeout">30000</stringProp>
+      </ConfigTestElement>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="并发下单（50 线程 1 轮）">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <stringProp name="LoopController.loops">1</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">50</stringProp>
+        <!--
+          ramp_time = 0：50 个线程**立刻**全部启动。
+          这是刻意的 —— 这个脚本要的就是"同时到达"，把竞争造出来。
+          ⚠️ 如果改成 50（每线程间隔 1 秒），50 个请求会变成顺序执行，
+             它们之间**不产生任何竞争**，脚本会"全部通过"并且毫无价值。
+             （同一个道理在 OrderConcurrencyTest 里由 CountDownLatch 保证。）
+        -->
+        <stringProp name="ThreadGroup.ramp_time">0</stringProp>
+        <boolProp name="ThreadGroup.scheduler">false</boolProp>
+        <stringProp name="ThreadGroup.duration"></stringProp>
+        <stringProp name="ThreadGroup.delay"></stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <!-- ============ 下单（唯一一个采样器） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="下单 POST /api/order/orders">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{&quot;userId&quot;:${userId},&quot;trainNo&quot;:&quot;${TRAIN_NO}&quot;,&quot;travelDate&quot;:&quot;${__timeShift(yyyy-MM-dd,,P70D,,)}&quot;,&quot;seatType&quot;:${SEAT_TYPE}}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/order/orders</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP 头">
+            <collectionProp name="HeaderManager.headers">
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">Content-Type</stringProp>
+                <stringProp name="Header.value">application/json</stringProp>
+              </elementProp>
+            </collectionProp>
+          </HeaderManager>
+          <hashTree/>
+
+          <!--
+            每个线程一个不同的 userId（9300001 ~ 9300050）。
+            这一步让 50 个请求都"合法"，从而把唯一的约束收窄到**库存**上 ——
+            如果 userId 相同，失败原因会混进"重复购票"，
+            就测不出"票不够卖"这一件事了。
+
+            ⚠️ 用 JSR223 里算，而不是用 __intSum(${__threadNum},9300000,...)：
+               __intSum 把最后一个参数当"变量名"的条件依赖参数个数，
+               行为容易踩坑。一个 PreProcessor 把意图写清楚，代价只有一行。
+
+            ⚠️ 区间 9300000~9399999 与 JUnit 的 9100000~9199999 **错开**，
+               这样清理 SQL 和统计 SQL 都不会互相误伤。
+          -->
+          <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="生成哨兵 userId">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">// ctx.getThreadNum() 从 0 开始，+1 让区间是 9300001~9300050
+vars.put('userId', String.valueOf(9300000 + ctx.getThreadNum() + 1))</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223PreProcessor>
+          <hashTree/>
+
+          <!--
+            ⚠️ 待验证（不是核心功能，失败也不影响判据）：
+               把采样器的 label 按结果改掉，好让聚合报告分成两行
+               "下单-200" / "下单-409"，一眼就能看出 20/30 的分布。
+
+               ⚠️ 没实测过它是否真的影响聚合报告的输出 ——
+                  如果跑完发现报告里还是只有一行，删掉这个后置处理器即可，
+                  **其它部分完全不受影响**。判据永远以 SQL 为准。
+          -->
+          <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="按结果改 label（待验证）">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = prev.getResponseCode()
+if (code == '200') {
+    prev.setSampleLabel('下单-200')
+} else if (code == '409') {
+    prev.setSampleLabel('下单-409')
+} else {
+    prev.setSampleLabel('下单-意外-' + code)
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223PostProcessor>
+          <hashTree/>
+
+          <!--
+            ⭐ 断言：响应码必须是 200 或 409，**两个都算成功**。
+
+            为什么必须这样写：JMeter 默认把非 2xx 全标成 failed。
+            如果不翻回来，脚本跑完会显示 "Err: 30 (60%)"，
+            读的人分不清那 30 个是"抢票没抢到（设计如此）"还是"接口坏了"。
+            一个永远有大半错误率的并发测试等于没有并发测试。
+
+            ⚠️ 用 JSR223 而不是 ResponseAssertion 的原因和 stage4-smoke.jmx 一样：
+               ResponseAssertion 哪怕通过，也**翻不回 SampleResult 的成功标志**，
+               只能设 AssertionResult —— HTTP 那层的 failed 会留在统计里。
+
+            ⚠️ 反过来，"响应码是 200/409"**不能**证明"没有超卖"。
+               它只证明"接口没崩"。超卖要看数据库 —— 见文件头的两个检查。
+          -->
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言并标记通过：200 或 409">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = prev.getResponseCode()
+def body = prev.getResponseDataAsString()
+if (code == '200' || code == '409') {
+    // 抢到了(200)和没抢到(409)都是预期结果，都算成功
+    prev.setSuccessful(true)
+} else if (code == '404') {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('拿到 404 —— travelDate 那一天(今天+70天)没有库存行，先跑文件头里的 fixture SQL。body=' + body)
+} else if (code == '400') {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('拿到 400 —— 请求体不合法，检查 ${userId} 有没有被赋上值。body=' + body)
+} else {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('期望 200 或 409，实际 code=' + code + ' body=' + body)
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+
+        <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="查看结果树" enabled="true">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <timestamp>true</timestamp>
+              <success>true</success>
+              <label>true</label>
+              <code>true</code>
+              <message>true</message>
+              <threadName>true</threadName>
+              <dataType>true</dataType>
+              <encoding>false</encoding>
+              <assertions>true</assertions>
+              <subresults>true</subresults>
+              <responseData>false</responseData>
+              <samplerData>false</samplerData>
+              <xml>false</xml>
+              <fieldNames>true</fieldNames>
+              <responseHeaders>false</responseHeaders>
+              <requestHeaders>false</requestHeaders>
+              <responseDataOnError>true</responseDataOnError>
+              <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+              <assertionsResultsToSave>0</assertionsResultsToSave>
+              <bytes>true</bytes>
+              <sentBytes>true</sentBytes>
+              <url>true</url>
+              <threadCounts>true</threadCounts>
+              <idleTime>true</idleTime>
+              <connectTime>true</connectTime>
+            </value>
+          </objProp>
+          <stringProp name="filename"></stringProp>
+        </ResultCollector>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

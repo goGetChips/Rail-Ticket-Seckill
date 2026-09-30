@@ -4,10 +4,15 @@
    阶段 4 冒烟测试：查询接口全部走通
   ============================================================================
 
-   这不是压测，是**冒烟测试**：1 线程、1 轮、顺序打 6 个请求。
+   这不是压测，是**冒烟测试**：1 线程、1 轮、顺序打 8 个请求。
    它回答的问题是「接口是否可用」，不是「接口能扛多少 QPS」。
    两者要的配置完全不同（冒烟要确定性和可读性，压测要并发数和持续时间），
    混在一个脚本里会让两边都做不好。
+
+   ⚠️ 阶段 5 给本脚本加了第 7、8 两个采样器（下单接口的 400 / 404 回归）。
+      它们**不需要任何 fixture**（一个故意让校验失败、一个故意用车次号 NOPE），
+      所以本脚本仍然是"跑起来就能用、不留数据"的。真正的下单并发在
+      scripts/perf/stage5-order.jmx —— 那个脚本需要先造库存行。
 
    为什么阶段 4 就要有它（有三条独立的理由）：
 
@@ -24,26 +29,26 @@
       见本文件末尾的「怎么跑」。
 
    ⭐ 【判读方法：期望错误率是 0%，任何非 0 都说明有真问题】
-     6 个请求里有 2 个**故意期望 4xx**（400 / 404）。难点在于
-     JMeter 会把任何非 2xx/3xx 的采样器标成 failed，
+     8 个请求里有 3 个**故意期望 4xx**（第 5 条 400、第 7 条 400、第 8 条 404）。
+     难点在于 JMeter 会把任何非 2xx/3xx 的采样器标成 failed，
      **而且一条「通过」的 ResponseAssertion 并不会把它翻回成功**
      —— ResponseAssertion 通过时设的是 AssertionResult 的成功标志，
         不是 SampleResult 的，所以 HTTP 那层的 failed 会留下来。
 
-     如果就这么放着，脚本跑完会显示 "Err: 2 (33.33%)"，
-     读的人分不清这 2 个错误是「设计如此」还是「接口坏了」——
-     一个永远有 1/3 错误率的冒烟测试等于没有冒烟测试。
+     如果就这么放着，脚本跑完会显示 "Err: 3 (37.5%)"，
+     读的人分不清这 3 个错误是「设计如此」还是「接口坏了」——
+     一个永远有几成错误率的冒烟测试等于没有冒烟测试。
 
-     所以这 2 个采样器用的是 JSR223 断言（Groovy）而不是 ResponseAssertion：
+     所以这 3 个采样器用的是 JSR223 断言（Groovy）而不是 ResponseAssertion：
      先判断状态码是不是期望的那个，是就显式调 `prev.setSuccessful(true)`
      把采样器翻回成功；不是就设 failureMessage 让采样器失败。
 
      于是判读规则变成一句话：
-       · 错误率 0%  → 6 条全部符合预期（包含那 2 条期望 4xx 的）
+       · 错误率 0%  → 8 条全部符合预期（包含那 3 条期望 4xx 的）
        · 错误率 > 0 → 真的有问题，看 failureMessage
 
      ⚠️ 别把这里的 400 当成"接口报错了"。400 是**期望值**：
-        `?size=0` 本来就该被参数校验拒绝。
+        `?size=0` 和空请求体本来就该被参数校验拒绝。
 
    【为什么用 __timeShift 而不是写死日期】
      写死 "2026-09-30" 这个脚本过两天就失效了（变成了查昨天的票），
@@ -378,6 +383,135 @@ if (code == '404') {
 } else {
     AssertionResult.setFailure(true)
     AssertionResult.setFailureMessage('期望 404（车次不存在），实际 code=' + code)
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 7. 下单接口的 @Valid 存活（回归，期望 400） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="7 下单校验 /api/order/orders 空 body（期望 400）">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/order/orders</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP 头">
+            <collectionProp name="HeaderManager.headers">
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">Content-Type</stringProp>
+                <stringProp name="Header.value">application/json</stringProp>
+              </elementProp>
+            </collectionProp>
+          </HeaderManager>
+          <hashTree/>
+          <!--
+            ⭐ 阶段 5 新增的接口带来了一个新的"静默失效"风险：
+            Controller 上漏写 @Valid。
+
+            漏写的症状**不是"校验宽松一点"，而是 500**：
+            {} 会一路走到 Service，req.userId() 是 null，
+            拆箱成 long 时抛 NullPointerException。
+
+            所以这条断言才是"@Valid 真的在跑"的唯一证据 ——
+            和第 5 条（?size=0 期望 400）是同一个原理，
+            只是这次挡的是请求体校验，不是查询参数校验。
+
+            ⚠️ 这里同时验 "details" 非空：
+               @Valid 是**第二个**校验入口机制，而 ApiExceptionHandler#details()
+               是按异常类型分流的 —— 没为它加分支的话，
+               状态码照样是 400，但 details 会是空的（这是同类 bug 的第二次出现）。
+               用 ASCII 子串检查，避免脚本里出现中文。
+          -->
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言并标记通过：400 + details 非空">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = prev.getResponseCode()
+def body = prev.getResponseDataAsString()
+if (code == '400' &amp;&amp; body.contains('"details"') &amp;&amp; !body.contains('"details":[]')) {
+    prev.setSuccessful(true)
+} else if (code == '500') {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('返回 500 而不是 400 —— 首先检查 OrderController 上的 @Valid 是不是漏了。body=' + body)
+} else {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('期望 400 且 details 非空，实际 code=' + code + ' body=' + body)
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 8. 下单的 404 语义（回归，期望 404） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="8 下单车次不存在（期望 404）">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <!--
+                  ⚠️ travelDate 必须是**未来**的日期，否则这条会拿到 400 而不是 404：
+                     @Valid 在进入 Controller 方法体**之前**执行，
+                     @FutureOrPresent 会先把过去的日期挡掉。
+                     用 __timeShift 动态算，避免脚本过期。
+                -->
+                <stringProp name="Argument.value">{&quot;userId&quot;:1,&quot;trainNo&quot;:&quot;NOPE&quot;,&quot;travelDate&quot;:&quot;${__timeShift(yyyy-MM-dd,,P1D,,)}&quot;,&quot;seatType&quot;:1}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/order/orders</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP 头">
+            <collectionProp name="HeaderManager.headers">
+              <elementProp name="" elementType="Header">
+                <stringProp name="Header.name">Content-Type</stringProp>
+                <stringProp name="Header.value">application/json</stringProp>
+              </elementProp>
+            </collectionProp>
+          </HeaderManager>
+          <hashTree/>
+          <!--
+            这条既是"404 语义在写接口上同样成立"的回归，
+            也是"「车次不存在」和「没放票」有没有做反"的检查：
+               · trainNo 拼错        → 车次不存在      → 404（在 Controller 判断）
+               · 车次对但没放票      → 库存行不存在    → 409（在 Service 抛异常）
+
+            做反了的话，这条会拿到 409 —— 而 409 意味着
+            "有人用 NOPE 这个车次扣了库存"，那是更严重的问题。
+          -->
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言并标记通过：404">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = prev.getResponseCode()
+def body = prev.getResponseDataAsString()
+if (code == '404') {
+    prev.setSuccessful(true)
+} else if (code == '409') {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('拿到 409 而不是 404 —— 「车次不存在」和「没放票」的判据搞反了。body=' + body)
+} else {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('期望 404（车次不存在），实际 code=' + code + ' body=' + body)
 }</stringProp>
             <stringProp name="scriptLanguage">groovy</stringProp>
           </JSR223Assertion>

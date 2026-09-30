@@ -37,11 +37,11 @@ spring:
   #   rail_train 是 train-service 的**数据所有权边界**（见 ADR-003 的数据所有权表）。
   #   订单、库存、用户分别在另外三个库里，终态下本服务不应该知道它们。
   #
-  # ⚠️ **但阶段 4 起，这条边界被有意打破了一次，必须说清楚：**
+  # ⚠️ **但阶段 4 起，这条边界被有意打破了，必须说清楚：**
   #
   #   余票查询（GET /api/inventory/seats）要读 rail_inventory.t_seat_inventory，
   #   而 t_seat_inventory 的 owner 终态是 rail-inventory-service（8083）。
-  #   现在阶段 4 还是单体，rail-inventory-service **尚不存在**，
+  #   现在还是单体，rail-inventory-service **尚不存在**，
   #   所以由本服务用**全限定表名**跨库读它 —— 见
   #   entity/SeatInventory.java 与 mapper/SeatInventoryMapper.java。
   #
@@ -56,8 +56,38 @@ spring:
   #   留着它比没有注释更糟：下一个读这段注释的人会**相信**跨库读不存在，
   #   于是排查跨库问题时直接跳过这个方向。
   #
-  #   🔴 **阶段 8 必须消除这个耦合**：把库存代码和 t_seat_inventory 一起搬到
-  #   rail-inventory-service，本服务不再出现 `rail_inventory` 这个前缀。
+  # ---------------------------------------------------------------------------
+  # 🔴🔴 【阶段 5 起：边界从"跨库读"扩大到"跨库写"，而且写入是事务性的】
+  # ---------------------------------------------------------------------------
+  #   上面整段只讲了**跨库读**。阶段 5 的下单接口让它不够用了，必须补：
+  #
+  #   一次下单会写到**三个库**：
+  #     rail_inventory.t_seat_inventory   扣减（条件 UPDATE）
+  #     rail_inventory.t_stock_flow       库存流水
+  #     rail_order.t_order / t_order_item 订单头 + 明细
+  #   而**读**的是 rail_train.t_train（取始发/终到站）。
+  #
+  #   ⭐ 【为什么这是本地事务，不是分布式事务 —— 这里最容易被误判】
+  #     InnoDB 的事务是「**服务器级**」的，不是「库级」的。
+  #     rail_train / rail_inventory / rail_order 是**同一个 MySQL 实例上的
+  #     三个 schema**（MySQL 里 schema 与 database 同义）。
+  #     `START TRANSACTION` 是对**那条连接**说的，不是对某个库说的 ——
+  #     所以一条连接上的**一个事务**能同时覆盖它访问的所有 schema。
+  #     **阶段 5 不需要 XA，也不需要任何分布式事务框架。**
+  #
+  #   ⚠️ 但这条结论的**前提是"单实例"**，而它写在配置文件的注释里
+  #      恰恰是因为它是个**部署事实**，不是代码性质：
+  #
+  #   🔴 **阶段 8 拆服务后，这个前提消失。** 两个进程各连自己的库，
+  #      扣减变成一次网络调用，而网络调用**不在本地事务里**
+  #      （可能对方提交了而响应丢了 = 结果未知）。
+  #      那时才第一次面对真正的分布式一致性问题，方案是补偿（对账 + MQ）。
+  #      完整论证见 service/OrderService.java 的类注释 ——
+  #      **它是给阶段 8 的人看的，不要只读这里。**
+  #
+  #   🔴 **阶段 8 必须消除这个耦合**：把库存代码（含 deductStock）
+  #   和 t_seat_inventory 一起搬到 rail-inventory-service，
+  #   本服务不再出现 `rail_inventory` 这个前缀。
   #   在那之前，它是一笔**有记录的临时债务**，不是疏忽。
   datasource:
     # -------------------------------------------------------------------------

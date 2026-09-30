@@ -4,19 +4,68 @@
 **解决什么问题**：Redis 的 key 怎么设计、Lua 为什么必须原子、什么情况下需要分布式锁、幂等有几层、以及**九条异常路径逐条怎么办**。
 **不包含**：业务流程时序（→ [03](03-business-flow.md)）、表结构（→ [06](06-database.md)）。
 
-> ⚠️ **本文除 Lua 脚本与 Redis 命令行为外，其余均为设计（计划中 / 阶段 5~9）。** 当前代码只实现了车站查询。实现状态见 [status/development-status.md](status/development-status.md)。
+> ⚠️ **本文的 Redis / MQ 部分仍是设计（计划中 / 阶段 7~9）；MySQL 那两道防线（② 条件 UPDATE、③ CHECK 约束）已在阶段 5 落地。** 实现状态见 [status/development-status.md](status/development-status.md)。
+>
+> 🔴 **但"落地"在阶段 5 要打个折**：MySQL 侧的**代码全部写完了，
+> 一次都没运行过**（写它们的时候本机 MySQL 被 DLP 加密起不来）。
+> 所以本文所有阶段 5 的内容都标 🟡，**没有任何实测数字**。
+> 唯一 🟢 的是**阶段 2 就验证过的东西**（CHECK 约束会拒绝违规数据、
+> 条件 UPDATE 在手工执行时受影响行数是 1 / 0）——
+> 那部分**不依赖阶段 5 的 Java 代码**。
+>
+> 具体到本文：
+> - §一 的 ② 条件 UPDATE —— 🟡 **代码已实现**（`SeatInventoryMapper.deductStock`）；**SQL 语义**本身 🟢（阶段 2 D1/D2）
+> - §一 的 ③ CHECK 约束 —— 🟢 阶段 2 已实测
+> - §二（Redis）、§三 的第一层、§四（MQ）、§五 中依赖 Redis/MQ 的条目 —— **仍是设计**
+> - §五 的 **E6（状态机 CAS）代码已在阶段 5 落地**（`payOrder` 用 `WHERE status=0` 做条件更新，不需要分布式锁）—— 🟡 未运行
+> - §六 的验证手段 —— 手段 1、2 的代码与脚本都已就位，**但本文不记录任何实测数字**，理由见 §六 末尾
 
 ---
 
 ## 一、不超卖的三道防线
 
-| 防线 | 位置 | 失效场景 | 详见 |
-| --- | --- | --- | --- |
-| ① **Lua 原子扣减** | Redis | Redis 挂了 / 数据丢失 / 主从切换 | 本文 §2 |
-| ② **条件 UPDATE（CAS）** | MySQL | — | [06-database.md §4](06-database.md) |
-| ③ **CHECK 约束** | MySQL | — | [06-database.md §4](06-database.md) |
+| 防线 | 位置 | 状态 | 失效场景 | 详见 |
+| --- | --- | --- | --- | --- |
+| ① **Lua 原子扣减** | Redis | ⏳ 阶段 7 | Redis 挂了 / 数据丢失 / 主从切换 | 本文 §2 |
+| ② **条件 UPDATE（CAS）** | MySQL | 🟡 **SQL 语义已实测（阶段 2 D1/D2）；应用层链路未实测** | — | [06-database.md §4](06-database.md) |
+| ③ **CHECK 约束** | MySQL | 🟢 阶段 2 已建（**约束行为已实测**） | — | [06-database.md §4](06-database.md) |
+
+> ⚠️ **② 为什么是 🟡 而不是 🟢** —— 它测过一半，**别把这一半当成全部**：
+>
+> | | 状态 |
+> | --- | --- |
+> | 这条 SQL **本身的语义**（有余票 → 1 行，售罄 → 0 行） | 🟢 [sql/99_verify.sql](../sql/99_verify.sql) 的 D1/D2，阶段 2 在 mysql 客户端里手工跑过 |
+> | **Java 应用有没有用对它**（0 行 → 409？并发下会不会超卖？catch 住异常后事务提交还是回滚？） | 🟡 代码写完，**一次都没跑过** |
+>
+> **后一行才是阶段 5 的判据。** 标记约定见 [01-project-guide.md §十](01-project-guide.md)。
 
 **为什么三道都要**：① 是性能层（挡掉绝大多数无效请求），②③ 是正确性层。**只有数据库层是"无论上游怎么乱来，都一定成立"的。**
+
+⭐ **阶段 5 交付的是 ②** —— 全项目唯一一句会修改库存的 SQL：
+
+```sql
+UPDATE rail_inventory.t_seat_inventory
+   SET sold_count = sold_count + 1
+ WHERE train_id = ? AND travel_date = ? AND seat_type = ?
+   AND sold_count < total_count          -- ← 这一行就是不超卖
+```
+
+**受影响的三种结果必须被区分**（`sql/03_rail_inventory.sql` §4 定下的规格）：
+
+| 受影响行数 | 含义 | 怎么处理 |
+| --- | --- | --- |
+| `1` | 扣减成功 | 继续写订单 |
+| `0` | **正常业务失败**（售罄） | 返回 **409**，不是异常、不是 500 |
+| 抛异常 | **系统失败、结果未知** | 回滚，返回 500 |
+
+⚠️ 实现手法上有一个**很容易写错**的点：自增必须是数据库算的
+（`SET sold_count = sold_count + 1`），**绝不能是 Java 算好再写进去**
+（`SET sold_count = #{javaValue}`）。后者是"丢失更新"：
+两个事务都读到 99、都写 100 → 卖出 2 张票但库存只 +1 → **少卖**。
+
+⚠️ 「0 行是**正常**业务失败」这个判断很容易被写成"返回 false / 抛异常"。
+所以 Mapper 的返回值是 `int` 而不是 `boolean` —— `boolean` 会把 0 压成 `false`，
+读起来像"失败了"，恰好抹掉这条规格。0 / 1 / 抛异常是三态，必须能被调用方看见。
 
 ---
 
@@ -145,6 +194,29 @@ SET rail:lock:warmup:{trainId}:{date} <uuid> NX PX 30000
 
 **⚠️ 由 E6 引出的一个必答追问**：**永远不要"先回滚库存再看订单状态"**。必须先原子地确认订单确实被取消了（受影响行数 = 1），再回滚库存。顺序反了就会把一张已经付款的票卖两次——**后果是超卖 + 资金纠纷**。
 
+> ⚠️⚠️ **E4 的「当作成功直接 ack」有一个前提，阶段 5 实地踩过了。**
+>
+> 那句话说的是**消息**被 ack（这条消息确实处理完了，不该重投），
+> **不是**"把事务也提交掉"。两者在代码里长得极像，但后果完全不同：
+>
+> ```
+> catch (DuplicateKeyException e) {
+>     return;          // ⛔ 如果此前已经写过别的东西 → 那些写入会被 COMMIT
+> }                    //    接口/消费端都"看起来正常"，数据却是半完成的
+> ```
+>
+> **判据：`catch` 块里只能 `throw`，不能 `return`** —— 除非你能保证
+> 走到这个 catch 时**本次事务还没有写过任何东西**。
+>
+> 阶段 5 的具体案例：`OrderService.createOrder` 的顺序是
+> ①扣库存 → ②写订单 → ③写票 → ③撞上唯一索引。此时①的扣减**已经执行过了**，
+> 一 `return` 就会把那次扣减提交、订单回滚 → **静默「少卖」**。
+> 所以那里只能 `throw`，让整个事务连①一起回滚。
+>
+> ⭐ 这条纪律值得记住：**"幂等"和"回滚"是两件事**。
+> 幂等说的是"重复执行不产生额外副作用"；
+> 而 catch-return 的问题是"把已经发生的副作用留下来了"。
+
 ---
 
 ## 六、如何证明"不会超卖"
@@ -163,6 +235,10 @@ start.countDown();  done.await();
 
 ### 手段 2：压测后数据校验（SQL）
 
+> **可直接执行**：整套校验（含建 fixture 与清理）在
+> [sql/12_verify_stage5_order.sql](../sql/12_verify_stage5_order.sql)。
+> 下面的 SQL 是它的摘要，改动时**两处必须一起改**。
+
 ```sql
 -- ① 超卖检查：必须返回 0 行
 SELECT * FROM rail_inventory.t_seat_inventory WHERE sold_count > total_count;
@@ -173,20 +249,126 @@ FROM rail_order.t_order_item
 GROUP BY user_id, train_id, travel_date, seat_type
 HAVING c > 1;
 
--- ③ 订单数与库存一致性：两列必须相等
-SELECT (SELECT COUNT(*) FROM rail_order.t_order WHERE status <> 2) AS order_cnt,
-       (SELECT SUM(sold_count) FROM rail_inventory.t_seat_inventory) AS sold_cnt;
+-- ③ 订单 ↔ 扣减流水 对账：必须返回 0 行（原版见下方说明，那条是错的）
+SELECT g.train_id, g.travel_date, g.seat_type,
+       g.order_cnt, COALESCE(f.flow_sum, 0) AS flow_sum
+FROM (SELECT train_id, travel_date, seat_type, COUNT(*) AS order_cnt
+      FROM rail_order.t_order_item o
+      JOIN rail_order.t_order t ON t.id = o.order_id AND t.status <> 2
+      GROUP BY train_id, travel_date, seat_type) g
+LEFT JOIN (SELECT train_id, travel_date, seat_type, SUM(change_count) AS flow_sum
+           FROM rail_inventory.t_stock_flow WHERE change_type = 2
+           GROUP BY train_id, travel_date, seat_type) f
+       ON f.train_id = g.train_id AND f.travel_date = g.travel_date AND f.seat_type = g.seat_type
+WHERE g.order_cnt <> COALESCE(f.flow_sum, 0);
 
 -- ④ Redis 与 MySQL 对账：Redis 余票 + MySQL 已售 必须等于总票额
+--    ⏳ **阶段 7 起有效** —— 阶段 5 没有 Redis，这条无从执行。
 --    Redis: GET rail:stock:{trainId}:{date}:{seatType}
 --    MySQL: SELECT total_count - sold_count FROM t_seat_inventory WHERE ...
+
+-- ⑤ 少卖检查：必须返回 0 行（阶段 5 新增）
+SELECT o.order_no, f.id, f.change_count
+FROM rail_order.t_order o
+LEFT JOIN rail_inventory.t_stock_flow f
+       ON f.biz_id = o.order_no AND f.change_type = 2
+WHERE o.status <> 2 AND (f.id IS NULL OR f.change_count <> 1);
 ```
+
+#### ⚠️ ③ 的原版是错的，这里说明它错在哪
+
+原版是：
+
+```sql
+SELECT (SELECT COUNT(*) FROM rail_order.t_order WHERE status <> 2) AS order_cnt,
+       (SELECT SUM(sold_count) FROM rail_inventory.t_seat_inventory) AS sold_cnt;
+-- 然后要求 order_cnt = sold_cnt
+```
+
+**这两个数从第一次运行起就不可能相等**，所以它是一个「必然失败的检查」——
+而必然失败的检查等于没有检查（没人会去看一个永远亮的红灯）。
+
+原因很具体：
+
+- `SUM(sold_count)` 把**种子数据里本来就卖掉的几百张**全算进来了
+  （`sql/11_seed_inventory.sql` 写 sold_count 时，`t_order` 还是 0 行）
+- `t_order` 的计数从 **0** 开始
+
+于是 `sold_cnt` 永远大于 `order_cnt`，差额是那几百张历史销量。
+
+**正确的问法**：不要问"全库总共卖了多少张"（这个问题没有答案，因为
+基线数据不可考），要问"**同一趟车、同一天、同一席别，卖出的票数
+和扣下的库存是否一致**"。后者与种子数据无关，因为种子数据没有订单，
+也不会参与 `t_order_item` 的分组。
+
+**为什么拿「流水」当基准，而不是拿 `sold_count` 当基准**：
+`sold_count` 含着一个未知的"种子基线"，而 `t_stock_flow` 只记录
+**本应用产生的每一次扣减**。流水是我们自己的账本，可以和订单逐笔对上。
+
+⚠️ 由此引出一条**建 fixture 时必须遵守的规则**：测试用的库存行
+`sold_count` 必须从 **0** 开始。否则"库存增量"就不再等于"本应用卖出的票数"，
+③ 也就失去意义。见 `sql/12_verify_stage5_order.sql` 文末的 fixture 段。
+
+#### ⚠️ ② 通过的原因和你想的不一样
+
+② 永远返回 0 行，**不是因为业务代码写对了**，而是因为
+`uk_user_train_date_seat` 这个唯一索引让 `COUNT(*) > 1` **物理上不可能**。
+
+所以它的真实作用是：**证明那个唯一索引真的建了**。
+（如果哪天有人把 `UNIQUE KEY` 改成 `KEY`，② 会立刻变红 —— 那正是它的价值。
+像上面 `sql/03_rail_inventory.sql` 里那张表所提醒的：索引定义一改，
+"最多命中一行"这个前提就没了，而错误是静默的。）
+
+#### ⭐ ⑤ 是阶段 5 新增的，也是 `t_stock_flow` 这张表存在的全部理由
+
+CHECK 约束 `ck_sold_not_exceed_total` 只能证明「**没有超卖**」。
+它**看不见「少卖」**：扣了库存但订单没写成功时，
+`sold_count` 增加、订单数不变，两条 CHECK 约束**都是满足的**。
+
+⑤ 就是为这一半准备的。它红了的最可能原因，是
+`OrderService` 里把唯一索引冲突 **catch 住之后 `return` 了**：
+
+> catch 块里一旦 `return`，Spring 的事务拦截器会认为方法成功结束 → **COMMIT**
+> → 那次库存扣减被提交，而订单被回滚。
+> 结果是：库存少了一张可卖的票、票没卖出去、接口规规矩矩返回 409、
+> **没有任何日志和告警**。只有对账能发现。
+>
+> **判据：`catch` 块里只能 `throw`，不能 `return`。**
 
 ### 手段 3：对账定时任务
 
 每 5 分钟跑一次上述 SQL，发现不一致就告警并记录。**这也是 Redis 与 MySQL 最终一致性的兜底。**
+⏳ 阶段 5 尚未实现定时任务；⑤ 这条 SQL 是它的雏形。
 
-> 手段 2 中的 ① 和 ② 已经**在本机实测过**（用违规数据确认数据库真的拒绝），见 [06-database.md §5](06-database.md)。手段 1、3 待阶段 5~9 实施。
+> **实测状态（阶段 5）—— 分成两层说，因为一层测过、一层没测过：**
+>
+> | 层 | 状态 | 证据 |
+> | --- | --- | --- |
+> | **SQL 层的 CAS 语义**（有余票 → 受影响 1 行；已售罄 → 受影响 **0 行**） | 🟢 **已实测** | [sql/99_verify.sql](../sql/99_verify.sql) 的 **D1 / D2** 两条，阶段 2 跑过。⚠️ 注意这是**手工在 mysql 客户端里**执行的，**不是通过 Java 应用** |
+> | **SQL 层的唯一索引 / CHECK 约束会拒绝违规数据** | 🟢 **已实测** | 同上的 A/B/C 各条 |
+> | **应用层的整条链路**（事务边界、并发、`catch` 不 `return`、跨库回滚） | 🟡 **未实测** | 代码已写完（`OrderService`），**一次都没跑过**（MySQL 被 DLP 加密） |
+>
+> ⭐ **为什么要分两层**：把"SQL 语句本身是对的"和"我的应用用对了这条语句"当成一件事，
+> 是阶段 5 最容易犯的自欺。D1/D2 证明了 **InnoDB 的条件 UPDATE 语义符合预期**；
+> 它**完全没有**回答"`OrderService` 有没有把这 0 行正确处理成 409 而不是异常"、
+> "并发 100 线程时连接池和行锁会怎样"、"catch 住唯一索引异常后事务是提交还是回滚"。
+> **后三个问题才是阶段 5 的判据。**
+>
+> 手段 1（并发单元测试）的代码已写完（`OrderConcurrencyTest`），
+> 手段 2 的校验脚本已写完（`sql/12_verify_stage5_order.sql`），
+> **但本文不记录任何实测数字** —— 理由见下。
+>
+> ⚠️ **为什么不写数字**：阶段 5 的 mapper 日志还开着 `debug`，
+> 此时测出的耗时没有意义（阶段 6 的事）；而"恰好卖出 20 张"这类
+> 计数结果**必须从真实运行里抄**，不能凭设计推断着写。
+> 本文档的规则是「**禁止编造数字**」，所以这里留空：
+>
+> | 待回填的数字 | 从哪来 |
+> | --- | --- |
+> | 100 线程抢 20 张 → 成功数 / 售罄数 | `OrderConcurrencyTest` 的控制台输出（`[并发实测]` 那几行） |
+> | 50 线程同一用户 → 最终 `sold_count` | 同上 |
+> | 观测到的死锁次数 | 同上（**未观测到就写"未观测到"，不能写"不会有"**） |
+> | JMeter 50 线程的错误率 | `scripts/perf/stage5-order.jmx` 的聚合报告 |
 
 ---
 

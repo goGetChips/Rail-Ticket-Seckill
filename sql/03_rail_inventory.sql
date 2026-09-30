@@ -27,7 +27,7 @@ CREATE TABLE `t_seat_inventory` (
 
     PRIMARY KEY (`id`),
 
-    -- （一）业务主键：一行 = 一个车次 + 一天 + 一种席别
+    -- （一）业务主键：一行 = 一个车次 + 一天 + 一种席别 实际情况也是这样
     UNIQUE KEY `uk_train_date_seat` (`train_id`, `travel_date`, `seat_type`),
 
     -- （二）最后一道防线：数据库层面拒绝负数库存和超卖

@@ -139,9 +139,11 @@ public class InventoryController {
          * —— 为什么传实体而不是 trainNo，见 InventoryService 的类注释。
          */
         Train train = trainService.getByTrainNo(trainNo);
+
         if (train == null) {
             return ResponseEntity.notFound().build();
         }
+
         return ResponseEntity.ok(inventoryService.listSeats(train, date));
     }
 }

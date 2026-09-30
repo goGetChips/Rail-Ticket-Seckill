@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+   =============================================================================
+    订单 Mapper
+   =============================================================================
+    ⚠️ 表名必须写全限定 `rail_order.t_order`。
+
+    本服务的数据源指向 rail_train 库，所以写 `t_order` 会被解释成
+    `rail_train.t_order` —— 一张不存在的表，报：
+
+        Table 'rail_train.t_order' doesn't exist
+
+    这个坑**不会在启动时报**，只在第一次真的执行到这条 SQL 时炸。
+    同一个手法在 SeatInventoryMapper.xml 里也用了（rail_inventory.t_seat_inventory）。
+    实体侧的 @TableName 也有同一份说明，见 entity/Order.java。
+-->
+<mapper namespace="com.railseckill.train.mapper.OrderMapper">
+
+    <!-- =======================================================================
+         订单状态流转（条件 UPDATE / CAS）
+         =======================================================================
+         `AND status = #{expectedStatus}` 是整个方法的要害。
+
+         读法：**"如果这单现在还是 expectedStatus，就把它改成 newStatus；
+               否则什么都不做，并告诉我 0 行。"**
+         判断和写入在一条 SQL 里完成，中间没有可以被别人插进来的窗口 ——
+         和库存扣减的 `AND sold_count < total_count` 是同一个手法。
+
+         【为什么不用分布式锁】
+         这个问题阶段 5 只有"同一个进程内的并发"这一种形态
+         （单模块、单实例），InnoDB 的行锁已经覆盖。
+         加锁会多一次网络往返 + 一把锁的生命周期管理，没有正确性收益。
+
+         【为什么不用 SELECT ... FOR UPDATE 再 UPDATE】
+         那是两趟数据库往返，而这里一趟就够。
+         更关键的是：两趟写法需要应用层自己记"我读到的状态是什么"，
+         而那个值在读和写之间可能已经变了 —— 条件 UPDATE 不给你
+         犯这个错的机会，因为它根本不接受应用层传来的"当前状态"。
+         ⚠️ 唯一的例外是 0 行之后那次分类查询（见 OrderService#payOrder），
+            那一次 SELECT 是**为了生成错误信息**，不参与任何写入决策。
+
+         【受影响行数只能是 0 或 1】
+         因为 order_no 上有唯一索引 uk_order_no。这一点和库存扣减
+         依赖 uk_train_date_seat 是同一个道理 ——
+         "1 行 = 成功"这个契约的依据在索引上，不在 SQL 写得聪明。
+         ======================================================================= -->
+    <update id="updateStatus">
+        UPDATE rail_order.t_order
+        SET status = #{newStatus}
+        WHERE order_no = #{orderNo}
+          AND status = #{expectedStatus}
+    </update>
+
+</mapper>
