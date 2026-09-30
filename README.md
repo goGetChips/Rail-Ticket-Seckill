@@ -11,15 +11,16 @@
 
 ## 当前开发状态
 
-**阶段 0~3 已完成。仓库里有能真正跑起来、并真的读到了数据库的服务。**
+**阶段 0~4 已完成。仓库里有能真正跑起来、并真的读到了数据库的服务。**
 
-当前可运行的只有 `rail-train-service` 一个模块，对外提供 **2 个车站查询接口**。购票、库存、秒杀、微服务拆分、MQ 全部尚未开始。
+当前可运行的只有 `rail-train-service` 一个模块，对外提供 **6 个查询接口**（车站 2 个、车次 3 个、余票 1 个）。购票、库存扣减、秒杀、微服务拆分、MQ 全部尚未开始。
 
 | 阶段 | 状态 |
 | --- | --- |
 | 0 需求与架构设计 / 1 环境搭建 / 2 数据库设计 / 3 项目初始化 | ✅ 已完成 |
-| **4 核心业务（单体）** | ⏭️ **下一步** |
-| 5~11（购票、压测、Redis、微服务拆分、MQ、复盘） | ⬜ 未开始 |
+| 4 核心业务（单体）—— 查询接口全部走通 | ✅ 已完成 |
+| **5 购票 + MySQL 库存（方案 A）** | ⏭️ **下一步** |
+| 6~11（压测、Redis、微服务拆分、MQ、复盘） | ⬜ 未开始 |
 
 **完整状态（含已完成功能、部分完成、已知技术债、待拍板事项）见 → [开发状态](docs/status/development-status.md)**
 
@@ -39,10 +40,17 @@ MySQL 必须先起来，否则服务能启动但**第一次调接口会 500**（
 
 ```bash
 MYSQL="D:/dev_tools/mysql-8.4.8-winx64/bin/mysql.exe"
-for f in 00_init 01_rail_user 02_rail_train 03_rail_inventory 04_rail_order 10_seed_train; do
+for f in 00_init 01_rail_user 02_rail_train 03_rail_inventory 04_rail_order \
+         10_seed_train 11_seed_inventory; do
   "$MYSQL" -h 127.0.0.1 -u root -p --default-character-set=utf8mb4 < sql/$f.sql
 done
 ```
+
+> ⚠️ **`10_seed_train` 和 `11_seed_inventory` 的顺序不能反，而且必须成对重跑。**
+> `10` 会重置 `t_train` 的自增 id，而 `11` 写库存时用 `train_id` 引用车次
+> ——只重跑 `10` 不重跑 `11`，库存行就会挂到别的车次上，**接口不报错，只是数据是错的**。
+>
+> `11` 的日期用 `CURDATE() + 1/2/3` 生成（不写死），所以种子数据不会过期。
 
 > ⚠️ `--default-character-set=utf8mb4` 不能省。本机 mysql 客户端默认按 GBK 解释字节，而 `.sql` 文件是 UTF-8 的——不加这个参数，中文会**以乱码形式存进数据库且不报任何错**。
 
@@ -59,11 +67,44 @@ IntelliJ 里直接 Run `RailTrainApplication` 即可，但要在 Run Configurati
 ### 4. 验证（别跳过）
 
 ```bash
-curl -i http://127.0.0.1:8082/api/train/stations/VNP     # 期望 200 + 北京南
-curl -o /dev/null -w "%{http_code}\n" \
-     http://127.0.0.1:8082/api/train/stations/NOPE      # 期望 404
-curl http://127.0.0.1:8082/api/train/stations           # 期望 14 条车站
+# --- 阶段 3 的接口 ---
+curl http://127.0.0.1:8082/api/train/stations                # 期望 14 条车站
+curl -i http://127.0.0.1:8082/api/train/stations/VNP          # 期望 200 + 北京南
+
+# --- 阶段 4 的接口（都要看到真实数据，不是"没报错"）---
+curl "http://127.0.0.1:8082/api/train/trains?page=1&size=2"   # 期望 total=3、中文站名
+curl "http://127.0.0.1:8082/api/train/trains/G1/stations"     # 期望 4 站
+curl "http://127.0.0.1:8082/api/train/trains/search?from=VNP&to=AOH"   # 期望 G1 + G3
+curl "http://127.0.0.1:8082/api/train/trains/search?from=JNK&to=NJH"   # 期望 G1 + G3（中途上车）
+D=$(date -d "+1 day" +%F)
+curl "http://127.0.0.1:8082/api/inventory/seats?trainNo=G1&date=$D"    # 期望 3 个席别
 ```
+
+**两条必须看状态码的检查**（`?size=0` 是唯一能证明参数校验在生效的方式，
+依赖缺失是**静默失效**的）：
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" \
+     "http://127.0.0.1:8082/api/train/trains?size=0"         # 期望 400，不是 200
+curl -sS -o /dev/null -w "%{http_code}\n" \
+     "http://127.0.0.1:8082/api/train/trains/NOPE/stations"  # 期望 404
+```
+
+同一套检查也做成了 JMeter 冒烟脚本（1 线程 6 个请求，含断言）：
+
+```bash
+export JAVA_HOME="D:/jdk-17.0.20.1"; export PATH="/d/jdk-17.0.20.1/bin:$PATH"
+/d/dev_tools/apache-jmeter-5.6.3/bin/jmeter.bat -n \
+  -t scripts/perf/stage4-smoke.jmx -l /tmp/stage4.jtl      # 期望 Err: 0 (0.00%)
+```
+
+> ⚠️ `jmeter.bat` 只认 PATH 上的 `java`，不读 `JAVA_HOME`。
+> **新开的终端本来就有 `java`**（本机 `JAVA_HOME` 与 PATH 都配好了）；
+> 上面那句 `export PATH` 是给 **AI 工具的 shell** 准备的——它继承的是改环境变量之前的旧进程环境。
+> ⚠️ 脚本里有 2 个请求**故意期望 4xx**（400 / 404）。判读规则是「**错误率 0% 才算通过**」，
+> 因为那两条已经把期望的 4xx 显式标记成成功了。原因见脚本头部注释。
+
+错误响应的形状与实测观测到的状态码 → [接口错误约定](docs/api/error-codes.md)。
 
 > ⚠️ 停止服务不要只关掉 Maven。`spring-boot:run` 会 fork 一个子 JVM，杀掉 Maven 后它**仍占着 8082 端口**：`netstat -ano | grep ":8082.*LISTENING"` 拿到 PID，再 `taskkill //F //PID <PID>`。
 
@@ -104,7 +145,7 @@ curl http://127.0.0.1:8082/api/train/stations           # 期望 14 条车站
 | 限流熔断 | Sentinel | 1.8.9 | 🔴 是否启用未定 |
 | 消息队列 | RocketMQ | 5.5.1 | 🟢 已装并跑通，🔴 **选型未拍板**，推迟到阶段 9 |
 | 构建 | Maven | 3.9.16（`mvnw` wrapper） | 🟢 已实测 |
-| 压测 | JMeter | 5.6.3 | 🟢 已装，**尚未发过请求** |
+| 压测 | JMeter | 5.6.3 | 🟢 已实测发请求（阶段 4 冒烟脚本 6 请求 / 0 错误） |
 | 容器化 | Docker | — | ❌ 公司电脑无法安装，**已放弃此路线** |
 
 > Docker 不可用是本项目的一等约束：MySQL、Redis、Nacos 全部以 Windows 原生方式安装，由此带来若干平台特有的坑（见 [技术栈 §6](docs/04-technology.md)）。
@@ -150,6 +191,7 @@ curl http://127.0.0.1:8082/api/train/stations           # 期望 14 条车站
 | [04 技术栈与选型](docs/04-technology.md) | 版本矩阵、端口规划、环境搭建、本机特有的三个坑 |
 | [05 秒杀与库存](docs/05-seckill.md) | 不超卖的三道防线、Lua 脚本、幂等、MQ 异常路径矩阵 |
 | [06 数据库设计](docs/06-database.md) | 表设计决策、不超卖的数据库侧防线、验证证据 |
+| [接口错误约定](docs/api/error-codes.md) | **实测观测到**的状态码与错误体形状、为什么还没有错误码枚举 |
 | [07 风险与已知缺陷](docs/07-risks.md) | 会在哪里出问题、本设计已知没解决的地方 |
 | [开发状态](docs/status/development-status.md) | **做到哪了**、技术债、下一步 |
 | [ADR 决策记录](docs/decisions/) | 单个架构决策的完整权衡过程 |

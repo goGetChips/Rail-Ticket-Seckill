@@ -4,7 +4,8 @@
 **解决什么问题**：功能边界、状态流转、主链路时序、以及"跑到什么程度算这个阶段完成"。
 **不包含**：为什么这么拆服务（→ [02](02-architecture.md)）、Redis/Lua 的实现细节（→ [05](05-seckill.md)）。
 
-> ⚠️ **本文描述的是目标流程。** 当前仓库只实现了车站查询两个接口，其余流程均为**计划中**。各流程的实现状态见 [status/development-status.md](status/development-status.md)。
+> ⚠️ **本文描述的是目标流程。** 当前仓库只实现了**查询类**接口（车站 2 个 + 车次 3 个 + 余票 1 个），
+> **所有写入类流程（下单、扣库存、支付）均为「计划中」**。各流程的实现状态见 [status/development-status.md](status/development-status.md)。
 
 ---
 

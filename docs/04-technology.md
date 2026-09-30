@@ -236,6 +236,25 @@ Not able to find Java executable or version. Please check your Java installation
 
 **排查提示**：看到这个报错时，**先 `where java` 看 PATH 里有没有**，不要去改 `JAVA_HOME`。本机 `JAVA_HOME` + `PATH` 在阶段 1 都已配好（[scripts/env/README.md](../scripts/env/README.md)），**新开的终端直接就能用**；只有在环境变量改过之前就已经开着的终端里才需要重开。
 
+**⚠️ 阶段 4 实测补充：AI 工具的 shell 属于「改环境变量之前就已经开着的终端」。**
+Claude Code 的 bash 会话继承的是它被拉起时那一刻的环境，`echo $PATH` 里**没有** jdk，
+于是 `jmeter.bat` 报 "Not able to find Java executable"。
+**不要据此认为"本机 PATH 没配好"** —— 用注册表判据区分：
+
+```console
+$ reg query "HKCU\Environment" //v JAVA_HOME
+    JAVA_HOME    REG_SZ    D:\jdk-17.0.20.1
+$ reg query "HKCU\Environment" //v Path
+    Path    REG_EXPAND_SZ    %JAVA_HOME%\bin
+```
+
+注册表里配好了 = 机器级配置正确，只是**当前进程**的副本是旧的。
+此时正确的做法是给该命令临时加上 PATH（而不是去改系统环境变量）：
+
+```bash
+export JAVA_HOME="D:/jdk-17.0.20.1"; export PATH="/d/jdk-17.0.20.1/bin:$PATH"
+```
+
 ---
 
 ## 五、环境验证清单
@@ -250,13 +269,13 @@ Not able to find Java executable or version. Please check your Java installation
 | V4 | Redis 基础命令 | `SET/GET/DECR/SADD/SISMEMBER` | ✅ 全部返回预期值 |
 | V5 | **Redis Lua 执行** ⭐ | `EVAL` / `SCRIPT LOAD` / `EVALSHA`；扣减脚本四个分支（未预热 -3 / 售罄 -1 / 重复 -2 / 成功） | ✅ **逐个实测符合预期** |
 | V6 | Redis 版本 | `INFO server` | ✅ 8.10.1 ⚠️ 非官方移植版 |
-| V7 | Nacos 启动 | 控制台 `http://127.0.0.1:8889/` | 🟡 旧端口（8888）曾返回 200；**改端口后控制台未复验**，下次启动时确认 |
+| V7 | Nacos 启动 | 控制台 `http://127.0.0.1:8889/` | 🟢 **2026-09-29 已复验**：`8889/` → 302 跳 `/next/` → 200，页面标题 `Nacos Console`；`8888/` → 404（服务端端口，不是控制台）；8888/8889/9888/9889 四端口均 LISTENING |
 | V8 | Nacos 端口规划 | 主 8888 / 控制台 8889 / gRPC 9888,9889 | ✅ 配置 + 启动日志双重确认，与 8080–8084 无冲突 |
 | V9 | SCA 版本兼容 ⭐ | `mvn dependency:tree` | ✅ **已于阶段 0 提前完成** |
 | V10 | MyBatis-Plus 依赖 | 引入两个 artifact | ✅ 已于阶段 0 提前完成 |
-| V10b | MyBatis-Plus **运行时**可用 | 写一个分页查询实际执行 | ⏳ 待阶段 4 |
+| V10b | MyBatis-Plus **运行时**可用 | 写一个分页查询实际执行 | 🟢 **阶段 4 已关闭**：`GET /api/train/trains?page=1&size=2` 返回 `total=3`，且 debug 日志里能看到插件自动生成的 `SELECT COUNT(*)` 和被追加的 `LIMIT ?`。⚠️ 只断言 200 是测不出这一项的——插件没生效时 `total` 恒为 0 而状态码仍是 200 |
 | V11 | JMeter 可用 | `jmeter.bat --version` | ✅ 5.6.3，JDK 17 下实测输出正常 |
-| V11b | JMeter 发出一个请求 | 对 `/api/train/stations` 发一次 HTTP 请求 | ⏳ 待阶段 6 |
+| V11b | JMeter 发出一个请求 | 对 8082 实发 HTTP 请求 | 🟢 **阶段 4 已关闭**：`scripts/perf/stage4-smoke.jmx`（1 线程 6 请求，含 400/404 断言）→ `Err: 0 (0.00%)`。⚠️ 在 AI 工具的 shell 里跑要先 `export PATH="/d/jdk-17.0.20.1/bin:$PATH"`（该 shell 继承旧环境，见 §4.4） |
 | V14 | RocketMQ 启动 | NameServer 9876 + Broker 注册成功 | 🟡 历史上启动成功（有连续日志）；**改 Nacos 端口后未复验**，见 §4.2 |
 | V15 | RocketMQ 抗压性 | 内存占用观测 | 🔴 **未评估**。默认 4 GB 堆 + `AlwaysPreTouch`，本机空闲内存曾低至 1.5 GB |
 | V12 | **Redis 并发扣减** ⭐ | [scripts/env/verify-redis.sh](../scripts/env/verify-redis.sh)：100 张票 vs 1000 并发 → 余票恰好 0、恰好 100 人成功；同一用户 1000 并发 → 恰好扣 1 张 | ✅ **已实测** |

@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+   阶段 4 冒烟测试：查询接口全部走通
+  ============================================================================
+
+   这不是压测，是**冒烟测试**：1 线程、1 轮、顺序打 6 个请求。
+   它回答的问题是「接口是否可用」，不是「接口能扛多少 QPS」。
+   两者要的配置完全不同（冒烟要确定性和可读性，压测要并发数和持续时间），
+   混在一个脚本里会让两边都做不好。
+
+   为什么阶段 4 就要有它（有三条独立的理由）：
+
+     1. 阶段判据明确要求「用 curl / JMeter 走通」—— 两个都要，
+        只做 curl 不满足判据。
+     2. 关闭 V11b（docs/04-technology.md：「JMeter 还没发过任何请求」）。
+        装好的工具没发过一次请求，等于没验证过它可用。
+     3. 这是本仓库**第一个** JMeter 脚本。它同时验证了
+        「JMeter 能连上本机服务」「能断言响应码」「能把结果写成 jtl」。
+        阶段 6 压测要复用这套骨架，现在把路走通，那时只改线程组。
+
+   ⚠️ 运行前必须让 java 在 PATH 上：jmeter.bat 里调的是裸 `java`，
+      **它不读 JAVA_HOME**。本机 PATH 里没有 java，直接跑会失败。
+      见本文件末尾的「怎么跑」。
+
+   ⭐ 【判读方法：期望错误率是 0%，任何非 0 都说明有真问题】
+     6 个请求里有 2 个**故意期望 4xx**（400 / 404）。难点在于
+     JMeter 会把任何非 2xx/3xx 的采样器标成 failed，
+     **而且一条「通过」的 ResponseAssertion 并不会把它翻回成功**
+     —— ResponseAssertion 通过时设的是 AssertionResult 的成功标志，
+        不是 SampleResult 的，所以 HTTP 那层的 failed 会留下来。
+
+     如果就这么放着，脚本跑完会显示 "Err: 2 (33.33%)"，
+     读的人分不清这 2 个错误是「设计如此」还是「接口坏了」——
+     一个永远有 1/3 错误率的冒烟测试等于没有冒烟测试。
+
+     所以这 2 个采样器用的是 JSR223 断言（Groovy）而不是 ResponseAssertion：
+     先判断状态码是不是期望的那个，是就显式调 `prev.setSuccessful(true)`
+     把采样器翻回成功；不是就设 failureMessage 让采样器失败。
+
+     于是判读规则变成一句话：
+       · 错误率 0%  → 6 条全部符合预期（包含那 2 条期望 4xx 的）
+       · 错误率 > 0 → 真的有问题，看 failureMessage
+
+     ⚠️ 别把这里的 400 当成"接口报错了"。400 是**期望值**：
+        `?size=0` 本来就该被参数校验拒绝。
+
+   【为什么用 __timeShift 而不是写死日期】
+     写死 "2026-09-30" 这个脚本过两天就失效了（变成了查昨天的票），
+     而失败长得像"接口坏了"，不像"脚本过期了"。
+     __timeShift(yyyy-MM-dd,,P1D) 每次运行时算当天+1，
+     和 sql/11_seed_inventory.sql 里的 CURDATE()+1 对齐。
+     ⚠️ 这个对齐依赖「JMeter 所在机器的日期 == MySQL 的 CURDATE()」。
+        本机开发两者同机同时区，成立；将来脚本跑在别的机器上要重新确认。
+
+   【为什么余票那条只断言 200，不断言内容】
+     内容依赖"当天+1"有没有种子数据。在午夜前后跨天时可能返回 200 + []，
+     而 200 + [] 是**合法的**（"这天还没放票"），不是故障。
+     断言内容会制造偶发失败 —— 偶发失败比没有断言更糟，因为人会开始忽略它。
+     分页那条断言了 "total":3，因为它是与日期无关的，且正是 V10b 的判据。
+-->
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="阶段 4 查询接口冒烟">
+      <stringProp name="TestPlan.comments">1 线程 1 轮，顺序验证 4 个正常接口 + 1 个 400 + 1 个 404</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">127.0.0.1</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">8082</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="HTTP 请求默认值">
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+        <stringProp name="HTTPSampler.domain">${HOST}</stringProp>
+        <stringProp name="HTTPSampler.port">${PORT}</stringProp>
+        <stringProp name="HTTPSampler.protocol">http</stringProp>
+        <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+        <stringProp name="HTTPSampler.connect_timeout">5000</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">10000</stringProp>
+      </ConfigTestElement>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="查询接口冒烟（1 线程 1 轮）">
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="循环控制器">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <stringProp name="LoopController.loops">1</stringProp>
+        </elementProp>
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        <boolProp name="ThreadGroup.scheduler">false</boolProp>
+        <stringProp name="ThreadGroup.duration"></stringProp>
+        <stringProp name="ThreadGroup.delay"></stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <!-- ============ 1. 车次分页列表（V10b 的判据） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="1 车次分页列表 ?page=1&amp;size=2">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="page" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">page</stringProp>
+                <stringProp name="Argument.value">1</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+              <elementProp name="size" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">size</stringProp>
+                <stringProp name="Argument.value">2</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/train/trains</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：HTTP 200">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">分页接口应返回 200</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <!--
+            total 必须是 3（t_train 里 3 趟车）。
+            这是分页插件的**运行时**证据：插件没生效时 total 恒为 0 且返回全部数据，
+            而 HTTP 状态码仍然是 200 —— 所以只断言 200 是测不出 V10b 的。
+          -->
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：total=3（V10b）">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="12345">&quot;total&quot;:3</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">total 应为 3；若为 0 说明分页插件没生效（V10b 失败）</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">16</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 2. 经停站（含中文，顺带验证 JMeter 侧的编码） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="2 经停站 /G1/stations">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/train/trains/G1/stations</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：HTTP 200">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">经停站接口应返回 200</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：首站是北京南（中文没乱码）">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="23456">北京南</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">响应里应出现中文站名；若失败先查脚本文件本身的编码是否为 UTF-8</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">16</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：4 个经停站">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="34567">AOH</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">G1 应有 4 站，末站 AOH</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">16</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 3. 按站查（自连接） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="3 按站查 /search?from=VNP&amp;to=AOH">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="from" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">from</stringProp>
+                <stringProp name="Argument.value">VNP</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+              <elementProp name="to" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">to</stringProp>
+                <stringProp name="Argument.value">AOH</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/train/trains/search</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：HTTP 200">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">按站查询应返回 200</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：G1 与 G3 两趟">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="45678">&quot;trainNo&quot;:&quot;G3&quot;</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">北京南→上海虹桥应至少包含 G3</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">16</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 4. 余票（日期动态生成） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="4 余票 /seats?trainNo=G1&amp;date=明天">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="trainNo" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">trainNo</stringProp>
+                <stringProp name="Argument.value">G1</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+              <elementProp name="date" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">date</stringProp>
+                <stringProp name="Argument.value">${__timeShift(yyyy-MM-dd,,P1D,,)}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/inventory/seats</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion" testname="断言：HTTP 200">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp name="49586">200</stringProp>
+            </collectionProp>
+            <stringProp name="Assertion.custom_message">余票接口应返回 200（200+[] 也算通过，见文件头注释）</stringProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+            <boolProp name="Assertion.assume_success">false</boolProp>
+            <intProp name="Assertion.test_type">8</intProp>
+          </ResponseAssertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 5. 参数校验真的生效（故意失败，期望 400） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="5 校验存活 ?size=0（期望 400）">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="size" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.name">size</stringProp>
+                <stringProp name="Argument.value">0</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+                <boolProp name="HTTPArgument.use_equals">true</boolProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/train/trains</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <!--
+            ⭐ 这条是整个脚本里最重要的一条断言。
+            spring-boot-starter-validation 缺失时**不报任何错**，只是注解静默失效，
+            ?size=0 照样返回 200 + []。所以「校验在不在」只能靠这条期望 400 来证明。
+
+            用 JSR223 而不是 ResponseAssertion 的原因见文件头「判读方法」：
+            ResponseAssertion 通过也翻不回 SampleResult 的成功标志。
+            这里同时验两件事：状态码 400 + 错误体是 ApiError 形状（含 details 字段）。
+            两个条件都满足才把采样器标成成功。
+          -->
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言并标记通过：400 + ApiError 形状">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = prev.getResponseCode()
+def body = prev.getResponseDataAsString()
+// '"details"' 是 ApiError 的字段名。用 ASCII 子串做检查，
+// 避免脚本里出现中文而引入额外的编码变量。
+if (code == '400' &amp;&amp; body.contains('"details"')) {
+    // 期望内的失败，显式翻回成功，让整体错误率保持 0%
+    prev.setSuccessful(true)
+} else {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('期望 400 + 错误体含 details，实际 code=' + code + ' body=' + body)
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+
+        <!-- ============ 6. 404 语义没被新 advice 破坏（回归） ============ -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="6 404 回归 /NOPE/stations（期望 404）">
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义的变量">
+            <collectionProp name="Arguments.arguments"/>
+          </elementProp>
+          <stringProp name="HTTPSampler.path">/api/train/trains/NOPE/stations</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+          <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+          <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          <boolProp name="HTTPSampler.postBodyRaw">false</boolProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <!--
+            阶段 3 就有这条 404 语义；这里做**回归**：新增的 ApiExceptionHandler
+            会不会把它变成 500？（写错一个 @ExceptionHandler 就会。）
+            同样用 JSR223，理由见文件头。
+          -->
+          <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="断言并标记通过：404">
+            <stringProp name="cacheKey">true</stringProp>
+            <stringProp name="filename"></stringProp>
+            <stringProp name="parameters"></stringProp>
+            <stringProp name="script">def code = prev.getResponseCode()
+if (code == '404') {
+    prev.setSuccessful(true)
+} else {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage('期望 404（车次不存在），实际 code=' + code)
+}</stringProp>
+            <stringProp name="scriptLanguage">groovy</stringProp>
+          </JSR223Assertion>
+          <hashTree/>
+        </hashTree>
+
+        <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="查看结果树" enabled="true">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <timestamp>true</timestamp>
+              <success>true</success>
+              <label>true</label>
+              <code>true</code>
+              <message>true</message>
+              <threadName>true</threadName>
+              <dataType>true</dataType>
+              <encoding>false</encoding>
+              <assertions>true</assertions>
+              <subresults>true</subresults>
+              <responseData>false</responseData>
+              <samplerData>false</samplerData>
+              <xml>false</xml>
+              <fieldNames>true</fieldNames>
+              <responseHeaders>false</responseHeaders>
+              <requestHeaders>false</requestHeaders>
+              <responseDataOnError>true</responseDataOnError>
+              <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
+              <assertionsResultsToSave>0</assertionsResultsToSave>
+              <bytes>true</bytes>
+              <sentBytes>true</sentBytes>
+              <url>true</url>
+              <threadCounts>true</threadCounts>
+              <idleTime>true</idleTime>
+              <connectTime>true</connectTime>
+            </value>
+          </objProp>
+          <stringProp name="filename"></stringProp>
+        </ResultCollector>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

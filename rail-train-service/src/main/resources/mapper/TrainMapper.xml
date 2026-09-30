@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  =============================================================================
+   TrainMapper 的 SQL
+  =============================================================================
+
+   ⚠️ namespace 必须**精确等于** Mapper 接口的全限定名。
+      拼错（比如少一个包名）不会在启动时报错，只在第一次调用那个方法时抛：
+
+          org.apache.ibatis.binding.BindingException:
+          Invalid bound statement (not found): com.railseckill.train.mapper.TrainMapper.selectTrainPage
+
+      这个报错信息里的 "not found" 很容易被误解成"接口方法没找到"，
+      实际是"XML 里的 statement id 和接口方法对不上"。
+      排查方向是检查 namespace 和方法名，不是检查接口有没有写。
+
+   ⚠️ 本文件在 src/main/resources/mapper/ 下，被 application.yml 里的
+      mybatis-plus.mapper-locations 扫到（那个配置值本来就是默认值）。
+
+   ⚠️ **反斜杠和转义**：XML 里 `<` 必须写成 `&lt;`（否则被当成标签开始）。
+      下面的自连接查询就踩到这一条。
+
+   =============================================================================
+    ⭐⭐ 关于三个 <resultMap>：为什么必须显式写 <constructor>
+   =============================================================================
+
+   这三个查询的返回类型是 Java 17 record。record 没有无参构造器，
+   所以 MyBatis 必须调用它的**全参构造器**来创建对象。
+
+   问题在于 MyBatis 怎么知道"结果集的哪一列对应构造器的哪一个参数"。
+   它的开关是 `argNameBasedConstructorAutoMapping`，而**默认值是 false**。
+   在 false 的情况下，它走的是：
+
+       applyColumnOrderBasedConstructorAutomapping
+       → 拿 resultset 的第 i 列，塞给构造器的第 i 个参数
+
+   **完完全全按物理顺序，一次都不比较名字。**
+
+   这意味着什么：
+     · 只要 SELECT 的列顺序和 record 组件的顺序错开一位，
+       值就会静默串位（比如 arrive_time 的值跑进了 departTime）
+     · 只要两边类型兼容，**不报任何错、不记任何日志**
+     · 只有当参数个数和列数对不上时才报
+       "Constructor auto-mapping failed. The constructor takes N arguments,
+        but there are only M columns in the result set."
+
+   一个把"出发时刻"和"到达时刻"调换了的接口，在测试里看起来
+   只是一组"有点奇怪但格式正确"的时间 —— 这类 bug 能活很久。
+
+   【本项目的对策：写显式的 <constructor>】
+   <arg column="..."/> 把"哪一列进哪个参数"写在明处，
+   顺序无关（column 是显式指定的），而且就写在 SELECT 旁边，
+   读的人不需要去翻 application.yml 才知道映射是怎么发生的。
+
+   另一个可选做法是打开 arg-name-based-constructor-auto-mapping: true
+   让 MyBatis 按名字匹配。**没有选它**，因为它是一个全局开关：
+   只要有人把它改回默认值，所有 record 映射会**同时**退化成按位置匹配，
+   而改动者不会意识到自己改了什么。显式 resultMap 不依赖任何全局状态。
+
+   ⚠️ 但 <arg> 的**书写顺序必须和 record 组件的声明顺序一致**。
+      这是 MyBatis 构造器映射的硬要求（它按顺序 match 构造器参数）。
+      改 record 的字段顺序时，务必同步改这里 —— 改错了会得到
+      "argument type mismatch" 或者更糟：两个同类型参数静默调换。
+
+   =============================================================================
+    关于 <arg> 里的 javaType
+   =============================================================================
+   必须写。因为 MyBatis 需要据此选择 TypeHandler，
+   而构造器参数在运行时没有类型信息可用（泛型擦除 + 反射限制）。
+   写错了症状是 "Cannot convert ... to ..." 或者时间格式解析失败。
+  =============================================================================
+-->
+
+<mapper namespace="com.railseckill.train.mapper.TrainMapper">
+
+    <!-- =======================================================================
+         resultMap 1：车次列表行（TrainListItem）
+         =======================================================================
+         组件顺序：trainNo, trainType, startStationCode, startStationName,
+                   endStationCode, endStationName, departTime, arriveTime, status
+         ======================================================================= -->
+    <resultMap id="trainListItemMap" type="com.railseckill.train.dto.TrainListItem">
+        <constructor>
+            <arg column="train_no" javaType="java.lang.String"/>
+            <arg column="train_type" javaType="java.lang.Integer"/>
+            <arg column="start_station_code" javaType="java.lang.String"/>
+            <arg column="start_station_name" javaType="java.lang.String"/>
+            <arg column="end_station_code" javaType="java.lang.String"/>
+            <arg column="end_station_name" javaType="java.lang.String"/>
+            <arg column="depart_time" javaType="java.time.LocalTime"/>
+            <arg column="arrive_time" javaType="java.time.LocalTime"/>
+            <arg column="status" javaType="java.lang.Integer"/>
+        </constructor>
+    </resultMap>
+
+    <!-- =======================================================================
+         resultMap 2：经停站（TrainStationItem）
+         =======================================================================
+         组件顺序：stationOrder, stationCode, stationName, cityName,
+                   arriveTime, departTime, mileage
+
+         ⚠️ 注意 arrive_time 在 depart_time **前面**，和 resultMap 1 里
+            depart_time 在前**正好相反**。这不是笔误 —— 两个 record 的字段
+            顺序是各自按业务语义排的（经停站列表里"到达再发车"符合直觉）。
+            **正是这种不一致让"按位置映射"变得危险**：
+            如果哪天有人把 resultMap 1 的映射复制过来改，很容易漏改顺序。
+            显式 column 属性就是防这个的。
+         ======================================================================= -->
+    <resultMap id="trainStationItemMap" type="com.railseckill.train.dto.TrainStationItem">
+        <constructor>
+            <arg column="station_order" javaType="java.lang.Integer"/>
+            <arg column="station_code" javaType="java.lang.String"/>
+            <arg column="station_name" javaType="java.lang.String"/>
+            <arg column="city_name" javaType="java.lang.String"/>
+            <arg column="arrive_time" javaType="java.time.LocalTime"/>
+            <arg column="depart_time" javaType="java.time.LocalTime"/>
+            <arg column="mileage" javaType="java.lang.Integer"/>
+        </constructor>
+    </resultMap>
+
+    <!-- =======================================================================
+         resultMap 3：可乘区间（TrainSegmentItem）
+         ======================================================================= -->
+    <resultMap id="trainSegmentItemMap" type="com.railseckill.train.dto.TrainSegmentItem">
+        <constructor>
+            <arg column="train_no" javaType="java.lang.String"/>
+            <arg column="train_type" javaType="java.lang.Integer"/>
+            <arg column="from_station_code" javaType="java.lang.String"/>
+            <arg column="from_station_name" javaType="java.lang.String"/>
+            <arg column="to_station_code" javaType="java.lang.String"/>
+            <arg column="to_station_name" javaType="java.lang.String"/>
+            <arg column="segment_depart_time" javaType="java.time.LocalTime"/>
+            <arg column="segment_arrive_time" javaType="java.time.LocalTime"/>
+            <arg column="segment_mileage" javaType="java.lang.Integer"/>
+        </constructor>
+    </resultMap>
+
+    <!-- =======================================================================
+         查询 1：车次分页列表
+         =======================================================================
+         【SQL 里没有 LIMIT —— 这是对的，不要加】
+         LIMIT 由 PaginationInnerInterceptor 在运行时拼接。
+         执行这条 SQL 之前，插件会先跑一遍自动生成的 COUNT 语句，
+         然后把 `LIMIT ?,?` 追加到下面这段 SQL 的末尾。
+
+         在 application.yml 里把 mapper 日志开到 debug 就能看到实际执行的两条语句。
+
+         【为什么要 JOIN t_station 两次】
+         t_train 里只有 start_station_id / end_station_id，要显示站名就得取。
+         让前端拿到 id 再去查车站接口是 N+1（列出 20 趟车要发 40 次请求），
+         所以在这里一次 JOIN 出来。
+
+         ⚠️ **这里的 JOIN 必须是 INNER JOIN，不要改成 LEFT JOIN。**
+            原因不在语义（这两列都是 NOT NULL，两种写法结果一样），
+            而在分页插件的行为：它生成 COUNT 语句时会尝试剥离 JOIN 来"优化"，
+            而剥离逻辑遇到第一个非 LEFT JOIN 就会整体放弃。
+            用 INNER JOIN，这个"优化"是空转，COUNT 语句每次都带着完整的 JOIN，
+            结果**永远正确**。
+            改成 LEFT JOIN 后优化会真的生效，而它判断"能不能剥"的依据
+            只是"别名有没有出现在 WHERE 里"，它**不知道剥掉之后行数会不会变**。
+            一旦将来这里加了一个一对多的 JOIN，COUNT 就会静默变小、total 变错。
+            详细论证见 config/MybatisPlusConfig.java 的类注释 §5。
+
+         【为什么必须写 ORDER BY】
+         分页**绝对不能**依赖"数据库默认按主键返回"。
+         不写 ORDER BY 时，MySQL 不保证两次查询的顺序一致；
+         数据量小、走全表扫描时看起来总是有序的，
+         一旦优化器改走别的索引，顺序就变了。
+         后果是**翻页时出现重复行和漏掉的行**：
+         page=1 和 page=2 各返回 2 条，但其中一条在两页里都出现了，
+         因为它两次查询的具体顺序不同。
+         这种 bug 不报错、只在数据量上去之后偶发，极难定位。
+         按 train_no 排序（有唯一索引 uk_train_no），顺序是稳定且确定的。
+         ======================================================================= -->
+    <select id="selectTrainPage" resultMap="trainListItemMap">
+        SELECT t.train_no,
+               t.train_type,
+               s1.station_code AS start_station_code,
+               s1.station_name AS start_station_name,
+               s2.station_code AS end_station_code,
+               s2.station_name AS end_station_name,
+               t.depart_time,
+               t.arrive_time,
+               t.status
+        FROM t_train t
+                 JOIN t_station s1 ON s1.id = t.start_station_id
+                 JOIN t_station s2 ON s2.id = t.end_station_id
+        ORDER BY t.train_no
+    </select>
+
+    <!-- =======================================================================
+         查询 2：某车次的经停站
+         =======================================================================
+         返回空列表的两种情况（Service 层负责区分）：
+           a) 车次号根本不存在
+           b) 车次存在但没有经停站数据
+         单看这个查询的结果分不清是哪种，所以 Controller 会先确认车次是否存在，
+         不存在就返回 404 而不是空数组。
+
+         【arrive_time / depart_time 的 NULL 是正常的】
+         WHERE 里**不要**加 `arrive_time IS NOT NULL` 之类的过滤 ——
+         始发站的 arrive_time 就是 NULL，过滤掉它站点顺序就断了。
+         详见 dto/TrainStationItem.java 的说明。
+
+         【ORDER BY station_order 是业务要求，不只是为了好看】
+         经停站必须按运行顺序返回，否则"从第几站到第几站"这个语义就没了。
+         station_order 上有唯一索引 uk_train_order(train_id, station_order)，
+         排序代价很低。
+         ======================================================================= -->
+    <select id="selectStops" resultMap="trainStationItemMap">
+        SELECT ts.station_order,
+               s.station_code,
+               s.station_name,
+               s.city_name,
+               ts.arrive_time,
+               ts.depart_time,
+               ts.mileage
+        FROM t_train t
+                 JOIN t_train_station ts ON ts.train_id = t.id
+                 JOIN t_station s ON s.id = ts.station_id
+        WHERE t.train_no = #{trainNo}
+        ORDER BY ts.station_order
+    </select>
+
+    <!-- =======================================================================
+         查询 3：按出发站 / 到达站查可乘区间
+         =======================================================================
+         这是本项目第一个"真正的"多表连接查询。核心是 t_train_station 的**自连接**：
+         同一趟车的两个站点记录，分别当作乘车站和下车站。
+
+         ⚠️ XML 里的 **< 必须写成 &lt;**，否则 XML 解析器会把它当成标签开始，
+            报 "The content of elements must consist of well-formed character data"。
+            这个报错出现在**启动时**（XML 被解析的那一刻），不在调用时，
+            所以定位方向是找 XML 语法而不是找 SQL 逻辑。
+
+         【ts1.station_order < ts2.station_order 这一句是整个查询的关键】
+         它一次性表达了两件事：
+           a) 这趟车**两站都停**（否则 JOIN 不上）
+           b) 上车站**排在下车站之前**（否则是坐反了方向）
+         用严格小于而不是小于等于，是为了排除"从某站到它自己"这种伪结果
+         —— 同一个 station_id 会同时匹配 ts1 和 ts2，order 相等，
+         用 <= 的话就会返回"济南西 → 济南西"。
+
+         【为什么不用 t_train.start_station_id / end_station_id】
+         那个写法只能回答"坐完全程"。"济南西 → 南京南"这种中途上车的查询
+         会返回空 —— 而这段区间明明有车。见 dto/TrainSegmentItem.java 的完整论证。
+
+         【t.status = 1 过滤掉停运车次】
+         注意这和查询 1（车次列表）不一样：列表接口**不过滤** status，
+         因为管理场景需要看到停运的车次。
+         这个查询的语义是"可售"，停运的车不可售，所以必须过滤。
+         **两个接口对同一列的处理不同是有意的**，不是不一致。
+
+         【segment_mileage 用两列相减得到】
+         t_train_station.mileage 存的是从始发站起算的**累计里程**，
+         区间里程 = 到站累计 - 上站累计。
+         ⚠️ 如果任一站点的 mileage 为 NULL，相减结果也是 NULL。
+            种子数据里所有站都填了值，所以当前不会出现。
+
+         【ORDER BY 的排序键选发车时刻】
+         用户查"北京南→上海虹桥有哪些车"，最关心的就是"几点能走"，
+         所以按区间的发车时刻（ts1.depart_time）升序。
+         加 train_no 作为第二排序键，是为了让同一发车时刻的多个车次
+         顺序稳定（否则两次调用可能给出不同的顺序）。
+
+         【这里没有 LIMIT / 分页】
+         当前只有 3 趟车。真实系统这个查询必须分页，而且必须带日期维度
+         （见 dto/TrainSegmentItem.java 里关于"可售"语义缺口的说明）。
+         **现在加分页是为一个不存在的问题写代码。**
+         ======================================================================= -->
+    <select id="selectByFromToStation" resultMap="trainSegmentItemMap">
+        SELECT t.train_no,
+               t.train_type,
+               s1.station_code            AS from_station_code,
+               s1.station_name            AS from_station_name,
+               s2.station_code            AS to_station_code,
+               s2.station_name            AS to_station_name,
+               ts1.depart_time            AS segment_depart_time,
+               ts2.arrive_time            AS segment_arrive_time,
+               ts2.mileage - ts1.mileage  AS segment_mileage
+        FROM t_train t
+                 JOIN t_train_station ts1 ON ts1.train_id = t.id
+                 JOIN t_train_station ts2 ON ts2.train_id = t.id
+                 JOIN t_station s1 ON s1.id = ts1.station_id
+                 JOIN t_station s2 ON s2.id = ts2.station_id
+        WHERE s1.station_code = #{fromCode}
+          AND s2.station_code = #{toCode}
+          AND ts1.station_order &lt; ts2.station_order
+          AND t.status = 1
+        ORDER BY ts1.depart_time, t.train_no
+    </select>
+
+</mapper>

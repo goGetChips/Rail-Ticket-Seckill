@@ -24,13 +24,13 @@
       ==========================================================================
       依赖：用到哪个加哪个
       ==========================================================================
-      阶段 3 只加三样：Web、MyBatis-Plus、MySQL 驱动。
+      阶段 3 加了四样：Web、MyBatis-Plus、MySQL 驱动；
+      阶段 4 补上 validation（查询参数校验）。
 
       刻意**没有**加的（以及它们计划在哪个阶段加）：
         · nacos-discovery        —— 阶段 8，现在没有别的服务可发现
         · spring-cloud-starter-openfeign —— 阶段 8，现在没有别的服务可调用
         · spring-boot-starter-data-redis —— 阶段 7，现在还没有热点数据要缓存
-        · spring-boot-starter-validation  —— 阶段 4 写查询参数校验时再加
         · spring-boot-starter-actuator    —— 阶段 8 做健康检查时再加
         · lombok                 —— 见下方说明
 
@@ -101,6 +101,29 @@
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
+        </dependency>
+
+        <!--
+          【校验依赖：阶段 4 引入】
+          提供 Jakarta Bean Validation 的实现（Hibernate Validator），
+          让 @Min / @Max / @NotBlank 这些注解真的会被执行。
+
+          ⚠️ 这个依赖缺失时的症状是**静默失效，不是编译错误**：
+             · 注解照常写，代码照常编译通过
+             · Spring 在类路径上找不到 Validator 实现，于是**跳过所有校验**
+             · `?size=0` 不会返回 400，而是照样执行一条 `LIMIT 0` 的查询并返回 200
+          这类"看起来一切正常、其实保护没生效"的依赖缺失，只能靠
+          **一条断言 400 的测试**来发现 —— 见 docs/api/error-codes.md。
+
+          【为什么 Spring MVC 的方法参数校验也需要它】
+          有个反直觉的点：Spring MVC 自带方法参数校验的执行逻辑，
+          但那份逻辑开头就查 `BEAN_VALIDATION_PRESENT`（类路径上有没有 Validator）。
+          所以没有这个 starter，MVC 那套校验代码根本不会触发。
+          详见 docs/api/error-codes.md 里"为什么没加 @Validated"一节。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
         <dependency>
